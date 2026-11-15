@@ -295,3 +295,49 @@ is why the unit is defined on row data, not on stored bytes.
 | GET `/config/general/<name>` | 404 | read via `/config/<name>` |
 | `/throttle/audit-events`, `/monitor/events/*`, `/flux/query` | 404 / 503 backend-down | rule metrics not retrievable on this build; notebooks measure client-side |
 | Throttle enforcement | not observed on lab build (config stored fine) | manual operator step — see "Enforcement caveat" above |
+
+## Split-host lab validation (2026-11-15)
+
+Five full `run_all.sh` suites on the lab (DEMO_SCALE_GB=1, CRITICAL_RATE=100):
+two local (`NOISY_HOST` empty), two remote (`NOISY_HOST=192.168.1.41:8765`),
+one remote with `QUEUE_TEST=1`. Throttler restored to the clean backup
+(disabled / 503 / no rules) after every run. All five reported overall FAIL —
+the honest result on this hardware, not a loosened check.
+
+Averaged critical GET ok-latency (ms) and noisy PUT ok-TPS:
+
+| phase | local p95 | remote p95 | local p99 | remote p99 | local noisy TPS | remote noisy TPS |
+|---|---|---|---|---|---|---|
+| baseline | 37.5 | 42.0 | 170 | 142 | — | — |
+| contention | 267 | 88 | 471 | 147 | 175 | 229 |
+| reference | 121 | 29 | 369 | 82 | 50 | 50 |
+| enforced | 3499 | 263 | 3971 | 735 | 15 | 31 |
+| recovery | 3614 | 274 | 3992 | 882 | 15 | 29 |
+| post-baseline | 1268 | 273 | 2516 | 717 | — | — |
+
+What this shows:
+
+- **Client-side contention dominated the old recovery numbers.** Moving the
+  noisy tenant to U02 cut U01 `client_cpu_pct` (≈93% → ≈82% in enforced) and
+  dropped critical p95 in enforced/recovery from ≈3.5–3.6 s to ≈263–274 ms.
+  The remaining gap to reference (≈29 ms) is real throttler/queue cost plus
+  client pacing backlog, not the noisy tenant's CPU on U01.
+- **Open-loop pacing + 4 critical threads cannot sustain 100 GET/s once
+  latency rises.** ≈25% of critical slots were missed (>50 ms late) in every
+  run, so `paced_client_kept_up` is INCONCLUSIVE and latency verdicts that
+  depend on it are INCONCLUSIVE. The missed-slot backlog also keeps
+  post-baseline p95 elevated (≈273 ms remote), which is why `baseline_stable`
+  reports FAIL — treat that as "client could not keep up / backlog carried
+  over", not proof of server drift.
+- **Accepted noisy TPS under 429 rejection was ≈30/s for a 50 TPS limit**
+  (remote), below the ≈45–47/s seen earlier; local mode fell to ≈15/s because
+  U01 was CPU-saturated. Enforcement was still observed (≈41% of noisy
+  requests got HTTP 429).
+- **`QUEUE_TEST=1` (24 vs 6 noisy threads):** critical p95 was 210 ms at 24
+  threads vs 293 ms at 6 — no evidence that a deeper ObjectScale throttle
+  queue costs the critical tenant, but accepted noisy TPS also fell
+  (20 vs 30/s), so the "same accepted TPS" condition was not met. Not a
+  clean product finding; recorded as measured.
+- **Clock offset:** after switching to the lowest-RTT `/health` sample,
+  remote offsets were ≈0.1–8.9 ms (one earlier run showed single-sample
+  spikes to ≈−128 ms from HTTP latency, which the guard correctly rejected).
