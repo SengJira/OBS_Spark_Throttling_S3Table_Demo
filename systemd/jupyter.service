@@ -3,19 +3,32 @@ Description=JupyterLab (ObjectScale PoC)
 After=network-online.target spark-master.service
 Wants=network-online.target
 
+# Runs as the dedicated, unprivileged `poc` user — not root.
+# One-time host preparation: README.md, "Running Jupyter as a non-root user".
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/OBS
+User=poc
+Group=poc
+SupplementaryGroups=spark
+WorkingDirectory=/opt/obs-poc
+Environment=POC_ROOT=/opt/obs-poc
+Environment=POC_SECRETS_DIR=/var/lib/obs-poc/secrets
 Environment=SPARK_HOME=/opt/spark
 Environment=PYSPARK_PYTHON=/opt/jupyter/venv/bin/python
 Environment=PYSPARK_DRIVER_PYTHON=/opt/jupyter/venv/bin/python
-EnvironmentFile=-/root/OBS/.env
-Environment=JUPYTER_CONFIG_DIR=/opt/jupyter/jupyter_lab_config
-Environment=JUPYTER_DATA_DIR=/opt/jupyter/kernels
-ExecStart=/opt/jupyter/venv/bin/jupyter lab --no-browser --allow-root -y
+EnvironmentFile=-/opt/obs-poc/.env
+# OBS_ROOT_PASSWORD=... only (0600 root:root; read by systemd, not by the user)
+EnvironmentFile=-/etc/obs-poc/mgmt.env
+Environment=JUPYTER_CONFIG_DIR=/var/lib/obs-poc/jupyter/config
+Environment=JUPYTER_DATA_DIR=/var/lib/obs-poc/jupyter/data
+Environment=JUPYTER_RUNTIME_DIR=/var/lib/obs-poc/jupyter/runtime
+ExecStart=/opt/jupyter/venv/bin/jupyter lab --no-browser -y
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
