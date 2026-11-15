@@ -9,9 +9,11 @@ DEFAULT_MAX_ATTEMPTS = 8
 
 def s3(user="admin", endpoint=None, timeout_s=(3, 10),
        max_attempts=DEFAULT_MAX_ATTEMPTS, max_pool_connections=10):
-    """S3 client for a PoC user. `max_attempts` is the total number of tries
-    (botocore standard mode); 1 disables retries so every server response —
-    including 429/503 throttle rejections — reaches the caller raw.
+    """S3 client for a PoC user. `max_attempts` is the TOTAL number of tries
+    (passed to botocore as `total_max_attempts`; botocore's own
+    `max_attempts` counts retries, so its value 1 would still retry once).
+    1 disables retries, so every server response — including 429/503
+    throttle rejections — reaches the caller raw.
     `max_pool_connections` must be >= the number of threads sharing the
     client, or botocore queues requests on its 10-connection default pool."""
     ak, sk = config.USERS[user]
@@ -27,7 +29,7 @@ def s3(user="admin", endpoint=None, timeout_s=(3, 10),
                           connect_timeout=timeout_s[0],
                           read_timeout=timeout_s[1],
                           max_pool_connections=max_pool_connections,
-                          retries={"max_attempts": max_attempts,
+                          retries={"total_max_attempts": max_attempts,
                                    "mode": "standard"}),
         verify=config.CA_BUNDLE,
     )
