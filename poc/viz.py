@@ -3,6 +3,7 @@ from IPython.display import HTML, display, clear_output
 import pandas as pd
 
 from . import results
+from .loadgen import classify, THROTTLED
 
 
 def banner(status, title, msg=""):
@@ -42,8 +43,30 @@ def object_table(objects):
     return table(df[["Key", "MiB"]])
 
 
+BIN_S = 5
+
+
+def tps_series(events, tenant, t0, t_end, bin_s=BIN_S):
+    """Per-bin request rates for one tenant over a CONTIGUOUS range of bins
+    from t0 to t_end. Empty bins are 0, so a stalled workload shows as a
+    drop to zero instead of a line joining its neighbours.
+    Returns (bin_start_seconds, total_tps, throttled_tps)."""
+    n_bins = int(max(0.0, t_end - t0) // bin_s) + 1
+    total, throttled = [0] * n_bins, [0] * n_bins
+    for e in events:
+        if e.tenant != tenant:
+            continue
+        i = int((e.ts - t0) // bin_s)
+        if 0 <= i < n_bins:
+            total[i] += 1
+            if classify(e.status, e.code) in THROTTLED:
+                throttled[i] += 1
+    xs = [i * bin_s for i in range(n_bins)]
+    return xs, [v / bin_s for v in total], [v / bin_s for v in throttled]
+
+
 class LiveChart:
-    """Two-panel live chart (TPS + p95 latency per tenant) + throttled counter."""
+    """Two-panel live chart (TPS + p95 latency per tenant) + throttled series."""
 
     def __init__(self, loadgen):
         self.lg = loadgen
@@ -55,35 +78,26 @@ class LiveChart:
 
     def draw(self):
         import matplotlib.pyplot as plt
-        import time as _t
+        import statistics
         ev = self.lg._events()
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
-        now = _t.time()
         if not ev:
             ax1.set_title("waiting for load…")
             display(fig); plt.close(fig); return
-        t0 = ev[0].ts
+        t0, t_end = ev[0].ts, max(e.ts for e in ev)
         for tenant, color in (("tenant-noisy", "#e65100"), ("tenant-critical", "#1565c0")):
-            pts = [e for e in ev if e.tenant == tenant]
-            xs, tp, lat = [], [], []
-            for e in pts:
-                xs.append(e.ts - t0)
-                lat.append(e.lat_ms)
-                tp.append(429 if e.status in (429, 503) else 200)
-            # rolling tps over 5s bins
-            bins = {}
-            for x in xs:
-                bins[int(x // 5)] = bins.get(int(x // 5), 0) + 1
-            ax1.plot(sorted(bins), [v / 5 for v in bins.values()],
-                     color=color, label=f"{tenant} TPS")
-            if lat:
-                import statistics
+            xs, tps, thr = tps_series(ev, tenant, t0, t_end)
+            ax1.plot(xs, tps, color=color, label=f"{tenant} TPS")
+            if any(thr):
+                ax1.plot(xs, thr, color=color, ls=":", lw=2,
+                         label=f"{tenant} throttled (429/SlowDown)")
+            pts = sorted((e.ts - t0, e.lat_ms) for e in ev if e.tenant == tenant)
+            if pts:
                 w = 10
-                xs_l = sorted(zip(xs, lat))
-                ys = [statistics.quantiles([b for _, b in xs_l[i:i+w]], n=20)[-1]
-                      if len(xs_l[i:i+w]) >= w else max(b for _, b in xs_l[i:i+w])
-                      for i in range(0, len(xs_l), w)]
-                ax2.plot([x for x, _ in xs_l[::w][:len(ys)]], ys,
+                ys = [statistics.quantiles([b for _, b in pts[i:i+w]], n=20)[-1]
+                      if len(pts[i:i+w]) >= w else max(b for _, b in pts[i:i+w])
+                      for i in range(0, len(pts), w)]
+                ax2.plot([x for x, _ in pts[::w][:len(ys)]], ys,
                          color=color, label=f"{tenant} p95")
         # closed phase boundaries (baseline/contention/…) as shaded bands
         for i, ph in enumerate(getattr(self.lg, "phases", [])):
@@ -98,10 +112,10 @@ class LiveChart:
                 ax.axvline(ts - t0, color="gray", ls="--", lw=0.8)
             ax1.text(ts - t0, ax1.get_ylim()[1] * .95, lab,
                      rotation=90, fontsize=9, va="top")
-        ax1.set_title("TPS per tenant"); ax1.legend(fontsize=9)
+        ax1.set_title(f"TPS per tenant ({BIN_S}s bins)"); ax1.legend(fontsize=9)
         ax2.set_title("p95 latency (ms)"); ax2.legend(fontsize=9)
         tot = self.lg.totals()
-        fig.suptitle(f"429/503 throttled: {tot['throttled']}   "
+        fig.suptitle(f"throttled (429/SlowDown): {tot['throttled']}   "
                      f"errors: {tot['errors']}   requests: {tot['events']}",
                      fontsize=12, fontweight="bold")
         display(fig); plt.close(fig)
