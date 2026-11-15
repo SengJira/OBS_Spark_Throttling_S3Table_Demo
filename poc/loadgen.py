@@ -727,9 +727,10 @@ class LoadGen:
         """Short tenant-noisy PUT burst under one key prefix — local or on
         the remote noisy host when NOISY_HOST is configured."""
         if self.remote_noisy is not None:
-            return self.remote_noisy.burst(bucket, prefix, seconds=seconds,
-                                           threads=threads, size=size,
-                                           keys_per_thread=keys_per_thread)
+            r = self.remote_noisy.burst(bucket, prefix, seconds=seconds,
+                                        threads=threads, size=size,
+                                        keys_per_thread=keys_per_thread)
+            return r.get("burst", r) if isinstance(r, dict) else r
         return put_burst("noisy", bucket, prefix, seconds=seconds,
                          threads=threads, size=size,
                          keys_per_thread=keys_per_thread)
