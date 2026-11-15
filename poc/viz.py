@@ -65,12 +65,64 @@ def tps_series(events, tenant, t0, t_end, bin_s=BIN_S):
     return xs, [v / bin_s for v in total], [v / bin_s for v in throttled]
 
 
+class ChartState:
+    """Incremental per-bin aggregates for the live chart. Each event is added
+    once; a redraw costs O(new events + bins), not O(all events) — the chart
+    runs in the load generator's process, so a slow redraw would stall the
+    worker threads and distort the very latencies being measured."""
+
+    def __init__(self, bin_s=BIN_S):
+        self.bin_s = bin_s
+        self.t0 = None
+        self.t_end = None
+        self.bins = {}          # tenant -> {bin index: [n, throttled, [lat_ms]]}
+        self._p95 = {}          # (tenant, bin index) -> (n when computed, p95)
+
+    def add(self, events):
+        for e in events:
+            if self.t0 is None:
+                self.t0 = e.ts
+            self.t_end = e.ts if self.t_end is None else max(self.t_end, e.ts)
+            i = int((e.ts - self.t0) // self.bin_s)
+            b = self.bins.setdefault(e.tenant, {}).setdefault(i, [0, 0, []])
+            b[0] += 1
+            if classify(e.status, e.code) in THROTTLED:
+                b[1] += 1
+            b[2].append(e.lat_ms)
+
+    def n_bins(self):
+        if self.t0 is None:
+            return 0
+        return int(max(0.0, self.t_end - self.t0) // self.bin_s) + 1
+
+    def series(self, tenant):
+        """(bin starts, total TPS, throttled TPS) over the contiguous range."""
+        n, bins = self.n_bins(), self.bins.get(tenant, {})
+        xs = [i * self.bin_s for i in range(n)]
+        tot = [bins[i][0] / self.bin_s if i in bins else 0 for i in range(n)]
+        thr = [bins[i][1] / self.bin_s if i in bins else 0 for i in range(n)]
+        return xs, tot, thr
+
+    def p95_series(self, tenant):
+        """(bin starts, p95 latency) for bins that have requests."""
+        from .loadgen import pctile
+        xs, ys = [], []
+        for i, b in sorted(self.bins.get(tenant, {}).items()):
+            hit = self._p95.get((tenant, i))
+            if hit is None or hit[0] != b[0]:
+                hit = self._p95[(tenant, i)] = (b[0], pctile(b[2], 95))
+            xs.append(i * self.bin_s); ys.append(hit[1])
+        return xs, ys
+
+
 class LiveChart:
     """Two-panel live chart (TPS + p95 latency per tenant) + throttled series."""
 
     def __init__(self, loadgen):
         self.lg = loadgen
         self.marks = []  # (epoch, label)
+        self.state = ChartState()
+        self._cursor = 0
 
     def mark(self, label):
         import time
@@ -78,27 +130,23 @@ class LiveChart:
 
     def draw(self):
         import matplotlib.pyplot as plt
-        import statistics
-        ev = self.lg._events()
+        fresh, self._cursor = self.lg.events_since(self._cursor)
+        self.state.add(fresh)
+        st = self.state
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
-        if not ev:
+        if st.t0 is None:
             ax1.set_title("waiting for load…")
             display(fig); plt.close(fig); return
-        t0, t_end = ev[0].ts, max(e.ts for e in ev)
+        t0 = st.t0
         for tenant, color in (("tenant-noisy", "#e65100"), ("tenant-critical", "#1565c0")):
-            xs, tps, thr = tps_series(ev, tenant, t0, t_end)
+            xs, tps, thr = st.series(tenant)
             ax1.plot(xs, tps, color=color, label=f"{tenant} TPS")
             if any(thr):
                 ax1.plot(xs, thr, color=color, ls=":", lw=2,
                          label=f"{tenant} throttled (429/SlowDown)")
-            pts = sorted((e.ts - t0, e.lat_ms) for e in ev if e.tenant == tenant)
-            if pts:
-                w = 10
-                ys = [statistics.quantiles([b for _, b in pts[i:i+w]], n=20)[-1]
-                      if len(pts[i:i+w]) >= w else max(b for _, b in pts[i:i+w])
-                      for i in range(0, len(pts), w)]
-                ax2.plot([x for x, _ in pts[::w][:len(ys)]], ys,
-                         color=color, label=f"{tenant} p95")
+            px, py = st.p95_series(tenant)
+            if px:
+                ax2.plot(px, py, color=color, label=f"{tenant} p95")
         # closed phase boundaries (baseline/contention/…) as shaded bands
         for i, ph in enumerate(getattr(self.lg, "phases", [])):
             for ax in (ax1, ax2):
@@ -113,14 +161,14 @@ class LiveChart:
             ax1.text(ts - t0, ax1.get_ylim()[1] * .95, lab,
                      rotation=90, fontsize=9, va="top")
         ax1.set_title(f"TPS per tenant ({BIN_S}s bins)"); ax1.legend(fontsize=9)
-        ax2.set_title("p95 latency (ms)"); ax2.legend(fontsize=9)
+        ax2.set_title(f"p95 latency per {BIN_S}s bin (ms)"); ax2.legend(fontsize=9)
         tot = self.lg.totals()
         fig.suptitle(f"throttled (429/SlowDown): {tot['throttled']}   "
                      f"errors: {tot['errors']}   requests: {tot['events']}",
                      fontsize=12, fontweight="bold")
         display(fig); plt.close(fig)
 
-    def refresh(self, out, seconds=30, step=2.0):
+    def refresh(self, out, seconds=30, step=5.0):
         """Refresh the chart inside an ipywidgets Output for `seconds`."""
         import time
         end = time.time() + seconds

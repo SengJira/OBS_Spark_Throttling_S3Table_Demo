@@ -182,21 +182,39 @@ def test_workers_use_clients_with_retries_disabled():
 
 
 def test_s3_factory_retry_parameter():
-    # real botocore config: default keeps retries, max_attempts=1 disables
-    seen = {}
-    orig = s3util.boto3.client
-    def fake_client(service, **kw):
-        seen["retries"] = kw["config"].retries
-        return object()
-    s3util.boto3.client = fake_client
-    try:
-        s3util.config.USERS.setdefault("admin", ("AK", "SK"))
-        real_s3(max_attempts=1)
-        assert seen["retries"]["max_attempts"] == 1
-        real_s3()
-        assert seen["retries"]["max_attempts"] == s3util.DEFAULT_MAX_ATTEMPTS > 1
-    finally:
-        s3util.boto3.client = orig
+    # max_attempts=1 must mean ONE try in total. botocore's `max_attempts`
+    # counts retries (1 = one retry), so the factory has to use
+    # `total_max_attempts` — checked on a real client's resolved config.
+    s3util.config.USERS["admin"] = ("AKIAEXAMPLEEXAMPLE00", "x" * 40)
+    cli = real_s3(max_attempts=1)
+    assert cli.meta.config.retries["total_max_attempts"] == 1
+    assert "max_attempts" not in cli.meta.config.retries
+    assert cli.meta.config.retries["mode"] == "standard"
+    default = real_s3().meta.config.retries["total_max_attempts"]
+    assert default == s3util.DEFAULT_MAX_ATTEMPTS > 1
+
+
+def test_single_attempt_client_does_not_retry_a_429():
+    # end to end through botocore: a 429 must surface after exactly one request
+    from botocore.awsrequest import AWSResponse
+    s3util.config.USERS["admin"] = ("AKIAEXAMPLEEXAMPLE00", "x" * 40)
+    cli = real_s3(max_attempts=1, endpoint="https://s3.invalid")
+    sent = []
+
+    def answer_429(request, **kw):
+        sent.append(request.url)
+        raw = types.SimpleNamespace(stream=lambda *a, **k: iter(()), read=lambda *a, **k: b"")
+        resp = AWSResponse(request.url, 429, {}, raw)
+        resp._content = (b"<Error><Code>TooManyRequests</Code>"
+                         b"<Message>slow</Message></Error>")
+        return resp
+    cli.meta.events.register("before-send.s3.PutObject", answer_429)
+    with pytest.raises(ClientError) as ei:
+        cli.put_object(Bucket="b", Key="k", Body=b"x")
+    assert len(sent) == 1, f"request was sent {len(sent)} times"
+    md = ei.value.response["ResponseMetadata"]
+    assert md["HTTPStatusCode"] == 429 and md["RetryAttempts"] == 0
+    assert loadgen.classify(429, ei.value.response["Error"]["Code"]) == "r429"
 
 
 @pytest.mark.parametrize("code,status,field", [
@@ -700,3 +718,13 @@ def test_access_denied_reason_only_matches_permission_failures(text, denied):
     assert bool(reason) is denied
     if reason:
         assert "Request ID" not in reason
+
+
+def test_cpu_pct_and_phase_window_reports_client_cpu():
+    assert loadgen.cpu_pct((100, 1000), (150, 1200)) == 25.0
+    assert loadgen.cpu_pct(None, (1, 2)) is None
+    assert loadgen.cpu_pct((5, 10), (5, 10)) is None          # no time elapsed
+    lg = loadgen.LoadGen(bucket="b", max_keys=0)
+    lg.start(noisy=False, critical=True); lg.start_phase("p"); time.sleep(0.3); lg.stop()
+    cpu = lg.phase_stats()["p"]["_window"]["client_cpu_pct"]
+    assert cpu is None or 0 <= cpu <= 100

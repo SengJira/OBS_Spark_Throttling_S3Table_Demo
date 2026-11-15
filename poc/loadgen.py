@@ -60,6 +60,25 @@ def classify(status, code=""):
 THROTTLED = {"r429", "r503s"}          # what counts as a throttling signal
 
 
+def cpu_times():
+    """(busy, total) jiffies of the whole client host from /proc/stat, or
+    None where that is unavailable."""
+    try:
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle = v[3] + (v[4] if len(v) > 4 else 0)
+        return sum(v) - idle, sum(v)
+    except Exception:
+        return None
+
+
+def cpu_pct(start, end):
+    """Client-host CPU utilisation (0-100, all cores) between two cpu_times()."""
+    if not start or not end or end[1] <= start[1]:
+        return None
+    return round(100.0 * (end[0] - start[0]) / (end[1] - start[1]), 1)
+
+
 def pctile(lats, p):
     """Linear-interpolation percentile (0-100) without numpy."""
     if not lats:
@@ -78,6 +97,8 @@ class LoadGen:
         self.max_keys = max_keys
         self.timeout_s = timeout_s
         self.events = collections.deque(maxlen=250000)   # live-chart buffer
+        self.events_total = 0               # events ever recorded (chart cursor)
+        self._totals = collections.Counter()
         self.stop_flag = threading.Event()
         self.paused = threading.Event()                  # global pause
         self._tenant_stop = {t: threading.Event() for t in TENANTS}
@@ -97,6 +118,7 @@ class LoadGen:
         self._phase_seq = 0
         self._phase_start = None            # wall
         self._phase_start_m = None          # monotonic
+        self._phase_cpu = None              # client-host CPU counters at start
         # tag -> group -> list of (ts, lat_ms, status, code, retries)
         self._agg_buf = collections.defaultdict(
             lambda: collections.defaultdict(list))
@@ -114,12 +136,15 @@ class LoadGen:
             self._phase_tag = f"{name}#{self._phase_seq}"
             self._phase_start = time.time()
             self._phase_start_m = time.monotonic()
+            self._phase_cpu = cpu_times()
 
     def _close_phase_locked(self, wall, mono):
         if self._phase_tag is not None and self._phase_start is not None:
             self.phases.append({"name": self._phase, "tag": self._phase_tag,
                                 "start": self._phase_start, "end": wall,
-                                "seconds": mono - self._phase_start_m})
+                                "seconds": mono - self._phase_start_m,
+                                "client_cpu_pct": cpu_pct(self._phase_cpu,
+                                                          cpu_times())})
 
     def end_phase(self):
         with self._lock:
@@ -142,18 +167,30 @@ class LoadGen:
              tag=None):
         ev = Event(ts, tenant, op, latency_ms, status, code, retries,
                    tag or self._phase or "init")
-        self.events.append(ev)
         with self._lock:
+            self.events.append(ev)
+            self.events_total += 1
+            cls = classify(status, code)
+            self._totals["ok" if cls == "ok" else
+                         "throttled" if cls in THROTTLED else "errors"] += 1
             self._agg_buf[ev.phase][f"{tenant} {op}"].append(
                 (ts, latency_ms, status, code, retries))
 
     def _events(self):
-        for _ in range(10):
-            try:
-                return list(self.events)
-            except RuntimeError:
-                continue
-        return list(self.events)
+        with self._lock:
+            return list(self.events)
+
+    def events_since(self, cursor):
+        """(new events, new cursor): events recorded after `cursor` (a value
+        previously returned here, 0 for all). Lets the live chart process
+        each event once instead of rescanning the whole buffer."""
+        with self._lock:
+            fresh = min(self.events_total - cursor, len(self.events))
+            if fresh <= 0:
+                return [], self.events_total
+            evs = list(itertools.islice(
+                self.events, len(self.events) - fresh, len(self.events)))
+            return evs, self.events_total
 
     @staticmethod
     def _agg(evs, span, phase_end=None):
@@ -223,7 +260,9 @@ class LoadGen:
                 entries.append({"name": self._phase, "tag": self._phase_tag,
                                 "start": self._phase_start, "end": time.time(),
                                 "seconds": time.monotonic()
-                                           - self._phase_start_m})
+                                           - self._phase_start_m,
+                                "client_cpu_pct": cpu_pct(self._phase_cpu,
+                                                          cpu_times())})
         out, seen = {}, collections.Counter()
         for ph in entries:
             seen[ph["name"]] += 1
@@ -233,18 +272,16 @@ class LoadGen:
             for grp, evs in self._agg_buf.get(ph["tag"], {}).items():
                 groups[grp] = self._agg(evs, ph["seconds"], ph["end"])
             out[key] = {"_window": {"start": ph["start"], "end": ph["end"],
-                                    "seconds": round(ph["seconds"], 1)},
+                                    "seconds": round(ph["seconds"], 1),
+                                    "client_cpu_pct": ph.get("client_cpu_pct")},
                         **groups}
         return out
 
     def totals(self):
-        th = err = ok = 0
-        for e in self._events():
-            c = classify(e.status, e.code)
-            if c in THROTTLED: th += 1
-            elif c == "ok": ok += 1
-            else: err += 1
-        return {"events": len(self.events), "ok": ok, "throttled": th,
+        """Running totals since start (O(1): kept by _rec, not rescanned)."""
+        with self._lock:
+            ok, th, err = (self._totals[k] for k in ("ok", "throttled", "errors"))
+        return {"events": self.events_total, "ok": ok, "throttled": th,
                 "errors": err,
                 "noisy_objects": (min(self._keys_reserved, self.max_keys)
                                   if self.max_keys else self._keys_reserved),
