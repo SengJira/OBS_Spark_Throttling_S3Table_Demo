@@ -66,7 +66,7 @@ def build_session(app="obs-poc", tables_user="tables-rw"):
             "spark.hadoop.fs.s3a.secret.key": adm_sk,
         }
 
-    tb_arn = f"arn:aws:s3tables:::bucket/{config.OBS_TABLE_BUCKET}"
+    tb_arn = config.table_bucket_arn()
     # OBS Iceberg REST expects the tableBucketARN as {prefix} path segment,
     # percent-encoded; OBS verifies SigV4 with S3-style double encoding,
     # which requires the patched iceberg runtime built by scripts/build_iceberg.sh

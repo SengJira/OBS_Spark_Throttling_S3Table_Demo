@@ -55,8 +55,17 @@ OBS_REGION = get("OBS_REGION", "us-east-1")
 OBS_NAMESPACE = get("OBS_NAMESPACE", "poc")
 OBS_ROOT_PASSWORD = os.environ.get("OBS_ROOT_PASSWORD", "")  # never stored
 ICEBERG_SIGNING_NAME = get("ICEBERG_SIGNING_NAME", "s3tables")
-ICEBERG_WAREHOUSE = get("ICEBERG_WAREHOUSE", "arn:aws:s3tables:::bucket/poc-lakehouse")
-TABLE_BUCKET = get("TABLE_BUCKET", ICEBERG_WAREHOUSE)
+# table bucket NAME, e.g. 'poc-lakehouse' (an ARN in an old .env is reduced
+# to its last path segment); every ARN is built by table_bucket_arn()
+TABLE_BUCKET = get("TABLE_BUCKET", "poc-lakehouse").rsplit("/", 1)[-1]
+
+
+def table_bucket_arn(name=None):
+    """S3 Tables ARN of a table bucket — also the Iceberg REST warehouse."""
+    return f"arn:aws:s3tables:::bucket/{name or TABLE_BUCKET}"
+
+
+ICEBERG_WAREHOUSE = table_bucket_arn()
 BUCKET_DATA = get("BUCKET_DATA", "poc-spark-data")
 BUCKET_THROTTLE = get("BUCKET_THROTTLE", "poc-throttle")
 DEMO_SCALE_GB = float(get("DEMO_SCALE_GB", "1"))
@@ -65,9 +74,7 @@ SPARK_MASTER = get("SPARK_MASTER", "spark://192.168.1.40:7077")
 SPARK_UI = get("SPARK_UI", "http://192.168.1.40:8080")
 SPARK_JARS = get("SPARK_JARS", "/opt/spark/jars")
 ICEBERG_REST_URI = OBS_TABLES_ENDPOINT.rstrip("/") + "/iceberg"
-# table bucket NAME (last ARN path segment), e.g. 'poc-lakehouse'
-OBS_TABLE_BUCKET = get("TABLE_BUCKET_NAME",
-                       ICEBERG_WAREHOUSE.rsplit("/", 1)[-1])
+OBS_TABLE_BUCKET = TABLE_BUCKET   # alias kept for existing callers
 TABLES_NAMESPACE = get("TABLES_NAMESPACE", "pocns")
 OBS_BUCKET = BUCKET_DATA
 OBS_BUCKET_THROTTLE = BUCKET_THROTTLE
