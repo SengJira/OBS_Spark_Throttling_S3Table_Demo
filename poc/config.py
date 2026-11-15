@@ -1,9 +1,14 @@
 """Config loader: reads .env (repo root), never prints secrets."""
-import os, pathlib, re
+import os, pathlib
 
-ROOT = pathlib.Path(os.environ.get("POC_ROOT", "/root/OBS"))
+# repo root: POC_ROOT, else the checkout this module lives in
+ROOT = pathlib.Path(os.environ.get("POC_ROOT")
+                    or pathlib.Path(__file__).resolve().parent.parent)
 ENV_FILE = ROOT / ".env"
-CREDS_FILE = pathlib.Path("/root/.poc/credentials")
+# directory holding the 0600 credential files (IAM keys, per-session Spark
+# secrets). Override with POC_SECRETS_DIR when Jupyter runs as a non-root user.
+SECRETS_DIR = pathlib.Path(os.environ.get("POC_SECRETS_DIR", "/root/.poc"))
+CREDS_FILE = SECRETS_DIR / "credentials"
 REPORT_DIR = ROOT / "reports"
 RAW_DIR = REPORT_DIR / "raw"
 BACKUP_FILE = REPORT_DIR / "throttle_backup.json"
