@@ -40,15 +40,18 @@ output-free), the report in `reports/PoC_Report.html`. Or run in JupyterLab:
 | `THROTTLE_PHASE_S` | `60` | notebook 02 phase length (the enforced phase is 2×) |
 | `PROPAGATION_S` | `300` | minimum age of the stored rules before enforcement is measured (ObjectScale rule cache: 300 s) |
 | `THROTTLE_SETTLE_S` | `120` | how long to wait for the mode switch to become visible |
+| `CRITICAL_RATE` | `100` | critical GET offer rate in notebook 02 (req/s); `0` = as fast as possible |
+| `QUEUE_TEST` | `0` | `1` adds the `enforced-24` queue-cost probe after recovery |
 | `POC_RUN_ID` | `demo-<timestamp>` | one run ID for the whole suite |
 | `NOISY_HOST` | empty | `host:port` of `poc/noisy_agent.py` on the second client host; empty keeps noisy PUTs local on U01 |
 | `NOISY_AGENT_TOKEN` | empty | shared `X-POC-Token` header for U01 ↔ U02 control traffic |
 
 Approximate run time at the defaults (2-vCPU lab host): `99_reset` 1–3 min,
-`00` 0.5 min, `01` ≈ 3 min, `02` ≈ 14 min (60 s baseline + 60 s contention +
-60 s dry-run + ≈ 120 s remaining propagation wait + mode switch + 120 s
-enforced + 60 s recovery + prefix bursts + two Spark writes), `03` ≈ 3 min,
-`04` < 0.5 min — **≈ 25 min in total**.
+`00` 0.5 min, `01` ≈ 3 min, `02` ≈ 16 min (60 s baseline + 60 s contention +
+60 s dry-run + ≈ 120 s remaining propagation wait with the noisy tenant
+paused + 60 s pre-baseline + 60 s reference + mode switch + 120 s enforced +
+60 s recovery + 60 s post-baseline + optional enforced-24 + prefix bursts +
+two Spark writes), `03` ≈ 3 min, `04` < 0.5 min — **≈ 27 min in total**.
 
 ### Remote noisy agent (optional second client host)
 
@@ -69,7 +72,13 @@ and the live chart stay on U01 (`192.168.1.40`). ObjectScale is unchanged.
 - Firewall: allow TCP 8765 only from `192.168.1.40`.
 - Notebook 02 Step 1 refuses to run if `/health` reports a U01/U02 clock
   offset over 50 ms, if the agent cannot reach ObjectScale on 9021, or if the
-  remote PUT/GET probe does not run as `tenant-noisy`.
+  remote PUT/GET probe does not run as `tenant-noisy`. It also stops any
+  leftover remote noisy load before starting, so a re-run cannot contaminate
+  the baseline.
+- Remote events are pulled continuously and flushed before every verdict, so
+  the slow queued PUTs and 429s are not lost at phase boundaries. The clock
+  offset is re-measured at each phase boundary; a phase fails if it exceeds
+  50 ms or if event pulls are lost for more than 5 s.
 
 For the customer comparison, run notebook 02 once with `NOISY_HOST` empty
 (local noisy on U01) and once with it set (remote noisy on U02), keeping the

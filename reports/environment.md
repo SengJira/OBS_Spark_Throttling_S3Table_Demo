@@ -237,6 +237,29 @@ The live chart used to rescan every recorded event on each redraw inside the
 load generator's process; it now keeps incremental per-bin state so a redraw
 does not stall the worker threads.
 
+### Paced recovery measurement (notebook 02 v2)
+
+Critical GETs are now open-loop paced (`CRITICAL_RATE`, default 100 req/s, 4
+threads) instead of 2 threads as fast as possible (≈570 GET/s), and latency is
+measured from the scheduled send time. A phase with more than 1 % missed slots
+is INCONCLUSIVE because the client could not keep up.
+
+The phase order is baseline → contention → simulation → propagation (noisy
+paused) → pre-baseline → reference → enforced → recovery → optional
+enforced-24 → post-baseline. `reference` paces the noisy tenant at the rule
+limit (50 PUT/s) in dry-run: it is the best result any throttler could give.
+`recovery_vs_reference` is the scored isolation verdict; `baseline_stable`
+(post-baseline p95 ≤ 1.25 × max(baseline, pre-baseline)) guards against
+environment drift; `recovery_p95_vs_baseline` is information only.
+
+With `NOISY_HOST` set, only the tenant-noisy PUTs run on the second host. The
+agent (`poc/noisy_agent.py`) reuses `LoadGen`, so timing/status telemetry is
+identical; U01 pulls events by request-start timestamp and flushes in-flight
+requests before every `phase_stats()` used for a verdict. The U01/U02 clock
+offset is measured by request round trip and re-checked at each phase
+boundary (fail above 50 ms); a loss of event contact for more than 5 s fails
+the phase. Local mode (`NOISY_HOST` empty) is unchanged.
+
 ## Demo dataset sizing
 
 `poc/demo_data.orders_df` generates rows on the Spark side from the row id
