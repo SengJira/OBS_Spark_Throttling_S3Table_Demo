@@ -4,20 +4,21 @@
 Creates: namespace `poc`, IAM users + access keys (poc-admin, tenant-noisy,
 tenant-critical, tables-rw, tables-ro), attaches managed policies, creates S3
 buckets (poc-spark-data, poc-throttle) and the S3 Tables table bucket
-(poc-lakehouse). Writes keys to /root/.poc/credentials (0600) and updates .env.
+(poc-lakehouse). Writes keys to <POC_SECRETS_DIR>/credentials (0600) and updates .env.
 
 Usage: OBS_ROOT_PASSWORD=xxx python3 scripts/prep_obs.py [--force-backup]
 (root password is read from env only — never written to files)
 """
-import json, os, re, sys, xml.etree.ElementTree as ET
+import os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from poc import config
 from poc.obs_admin import MgmtApi, Throttler, BackupRefused
 from poc import s3util
+from poc.spark_helpers import write_private
 
 VPOOL = "urn:storageos:ReplicationGroupInfo:90e1845b-f2af-4257-853e-b73a6142cc8b:global"
-CREDS_PATH = "/root/.poc/credentials"
+CREDS_PATH = config.CREDS_FILE
 ENV_PATH = config.ROOT / ".env"
 
 IAM_USERS = ["poc-admin", "tenant-noisy", "tenant-critical", "tables-rw", "tables-ro"]
@@ -132,9 +133,7 @@ def write_credentials(keys):
     for user, (ak, sk) in keys.items():
         eak, esk = ENV_KEY[user]
         lines += [f"{eak}={ak}", f"{esk}={sk}"]
-    with open(CREDS_PATH, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    os.chmod(CREDS_PATH, 0o600)
+    write_private(CREDS_PATH, "\n".join(lines) + "\n")   # 0600 from creation
     print(f"wrote {CREDS_PATH}")
 
 
@@ -144,8 +143,7 @@ def update_env(keys):
         eak, esk = ENV_KEY[user]
         text = re.sub(rf"^{eak}=.*$", f"{eak}={ak}", text, flags=re.M)
         text = re.sub(rf"^{esk}=.*$", f"{esk}={sk}", text, flags=re.M)
-    ENV_PATH.write_text(text)
-    os.chmod(ENV_PATH, 0o600)
+    write_private(ENV_PATH, text)
     print(f"updated {ENV_PATH}")
 
 

@@ -6,9 +6,14 @@ repos:
         entry: /opt/jupyter/venv/bin/nbstripout
         language: system
         files: '\.ipynb$'
+      - id: pyflakes
+        name: pyflakes (unused imports, undefined names)
+        entry: /opt/jupyter/venv/bin/python -m pyflakes
+        language: system
+        types: [python]
       - id: secret-scan
         name: secret-scan (passwords / keys / tokens)
-        entry: bash -c 'grep -rInE "(P@ssword|password[\"'"'"'= :]+[^\"'"'"' ]{6,}|AKIA[A-Z0-9]{16,}|aws_secret_access_key[\"'"'"'= :]+[A-Za-z0-9/+=]{20,}|secret[\"'"'"'= :]+[A-Za-z0-9/+=]{20,})" "$@" && exit 1 || exit 0' --
+        entry: bash -c 'grep -rInE "(P@ssword|password[\"'"'"'= :]+[^\"'"'"' ]{6,}|AKIA[A-Z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|aws_secret_access_key[\"'"'"'= :]+[A-Za-z0-9/+=]{20,}|secret[\"'"'"'= :]+[A-Za-z0-9/+=]{20,})" "$@" && exit 1 || exit 0' --
         language: system
         pass_filenames: true
         exclude: '(\.env|credentials|\.gitignore|\.pre-commit-config\.yaml|reports/throttle_backup\.json)'
