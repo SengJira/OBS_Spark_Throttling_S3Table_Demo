@@ -410,7 +410,7 @@ def test_verify_rule_accepts_valid():
     lambda r: r.update(bogus=1),
     lambda r: r.update(rateUnit="PPS"),
     lambda r: r["filters"].pop("principals"),
-    lambda r: r.update(limit={"value": 0}),
+    lambda r: r.update(limit={"value": -1}),
     lambda r: r["filters"].update(paths={"matcher": "fuzzy", "values": []}),
 ])
 def test_verify_rule_rejects_bad(mutate):

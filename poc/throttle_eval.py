@@ -28,17 +28,51 @@ DEFAULT_THRESHOLDS = {
     "critical_throttle_max": 0,       # critical GET 429/SlowDown count allowed
 }
 
-# Fields verified against PUT /throttle/config on this build.
-RULE_FIELDS = {"id", "rateUnit", "isDisabled", "filters", "limit", "scoping",
-               "description"}
-FILTER_FIELDS = {"principals", "verbs", "actions", "paths", "ips", "size"}
-PATH_MATCHERS = {"wildcard", "exact", "prefix"}
-RATE_UNITS = {"TPS", "BPS"}
+# Rule schema, confirmed live against PUT /throttle/config and
+# GET /throttle/template on ObjectScale 4.4 (see reports/environment.md):
+# every value outside these sets was rejected with HTTP 400.
+RULE_FIELDS = {"id", "description", "isDisabled", "rateUnit", "filters",
+               "limit", "scoping"}
+FILTER_FIELDS = {"principals", "verbs", "actions", "paths", "exclude_paths",
+                 "ips", "exclude_ips"}
+RATE_UNITS = {"TPS", "TPM"}                      # BPS -> 400
+PATH_MATCHERS = {"exact", "wildcard"}            # prefix -> 400
+IP_MATCHERS = {"exact", "wildcard4", "cidr4"}
+VERBS = {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "*"}
+SCOPING = {"principal", "action", "ip", "path", "verb"}
+# scoping dimension -> the filter it needs (server, for every dimension:
+# "scoping.per dimension '<d>' requires a corresponding filter")
+SCOPING_NEEDS = {"principal": "principals", "action": "actions", "ip": "ips",
+                 "path": "paths", "verb": "verbs"}
+
+
+def _live_actions(thr):
+    acts = thr.list_actions()
+    if isinstance(acts, dict):
+        acts = acts.get("actions", [])
+    return set(acts)
+
+
+def _check_matcher(problems, f, key, matchers):
+    if key not in f:
+        return
+    m = f[key]
+    if not isinstance(m, dict):
+        problems.append(f"{key} must be an object with matcher + values")
+        return
+    if m.get("matcher") not in matchers:
+        problems.append(f"{key}.matcher must be one of {sorted(matchers)}")
+    if not m.get("values"):
+        problems.append(f"{key}.values must be non-empty")
 
 
 def verify_rule(thr, rule):
-    """Validate `rule` against the accepted config schema and the live
-    actions list. Read-only — never modifies configuration."""
+    """Validate `rule` against the schema ObjectScale accepts and against the
+    LIVE action list. Read-only — never modifies configuration.
+
+    `ok` is True only if every check passed, including the live action
+    lookup: an action that the server does not list, or a lookup that could
+    not be made, is a problem."""
     problems = []
     unknown = set(rule) - RULE_FIELDS
     if unknown:
@@ -47,29 +81,59 @@ def verify_rule(thr, rule):
         problems.append("missing rule id")
     if rule.get("rateUnit") not in RATE_UNITS:
         problems.append(f"rateUnit must be one of {sorted(RATE_UNITS)}")
+    warnings = []
     lim = (rule.get("limit") or {}).get("value")
-    if not isinstance(lim, (int, float)) or lim <= 0:
-        problems.append("limit.value must be a positive number")
+    if isinstance(lim, bool) or not isinstance(lim, int) or lim < 0:
+        problems.append("limit.value must be 0 or a positive integer")
+    elif lim == 0:
+        warnings.append("limit.value 0 is accepted by the server, but its "
+                        "effect was not tested in this PoC")
+
     f = rule.get("filters") or {}
     bad_f = set(f) - FILTER_FIELDS
     if bad_f:
         problems.append(f"unknown filter fields: {sorted(bad_f)}")
-    if not (f.get("principals") or f.get("paths") or f.get("ips")):
-        problems.append("filters must select at least one dimension")
-    if "paths" in f:
-        p = f["paths"]
-        if p.get("matcher") not in PATH_MATCHERS:
-            problems.append(f"paths.matcher must be one of {sorted(PATH_MATCHERS)}")
-        if not p.get("values"):
-            problems.append("paths.values must be non-empty")
+    if not any(f.get(k) for k in FILTER_FIELDS):
+        problems.append("no valid filters: a rule needs at least one filter")
+    verbs, actions = f.get("verbs"), f.get("actions")
+    if verbs and actions:
+        problems.append("a rule uses verbs or actions, not both")
+    bad_verbs = set(verbs or []) - VERBS
+    if bad_verbs:
+        problems.append(f"unknown verbs: {sorted(bad_verbs)}")
+
     supported = {}
-    try:
-        acts = thr.list_actions()
-        supported["actions"] = acts if isinstance(acts, list) else acts.get(
-            "actions", acts)
-    except Exception as e:
-        supported["actions_error"] = str(e)[:80]
-    return {"ok": not problems, "problems": problems,
+    if actions:
+        try:
+            live = _live_actions(thr)
+            supported["actions"] = sorted(live)
+            bad_actions = sorted(set(actions) - live)
+            if bad_actions:
+                problems.append(f"actions not offered by this server: {bad_actions}")
+        except Exception as e:
+            supported["actions_error"] = str(e)[:80]
+            problems.append("actions could not be checked against the live "
+                            f"/throttle/config/actions list ({type(e).__name__})")
+
+    _check_matcher(problems, f, "paths", PATH_MATCHERS)
+    _check_matcher(problems, f, "exclude_paths", PATH_MATCHERS)
+    _check_matcher(problems, f, "ips", IP_MATCHERS)
+    _check_matcher(problems, f, "exclude_ips", IP_MATCHERS)
+    if "exclude_paths" in f and "paths" not in f:
+        problems.append("exclude_paths requires a paths filter")
+    if "exclude_ips" in f and "ips" not in f:
+        problems.append("exclude_ips requires an ips filter")
+
+    per = (rule.get("scoping") or {}).get("per") or []
+    bad_per = [d for d in per if d not in SCOPING]
+    if bad_per:
+        problems.append(f"scoping.per values must be from {sorted(SCOPING)}; "
+                        f"got {bad_per}")
+    for d in per:
+        need = SCOPING_NEEDS.get(d)
+        if need and not f.get(need):
+            problems.append(f"scoping.per '{d}' requires a {need} filter")
+    return {"ok": not problems, "problems": problems, "warnings": warnings,
             "supported": supported, "checked_at": time.time()}
 
 
