@@ -7,3 +7,4 @@ reports/PoC_Report.html
 notebooks/.ipynb_checkpoints/
 reports/current_run_id
 reports/owned_table_buckets.json
+reports/executed/
