@@ -47,10 +47,11 @@ class MgmtApi:
 
     def req(self, method, path, retry=True, **kw):
         kw.setdefault("timeout", 30)
-        hdrs = self._hdrs()
-        if "headers" in kw:
-            hdrs = {**hdrs, **kw.pop("headers")}
-        r = self.s.request(method, f"{self.base}{path}", headers=hdrs, **kw)
+        # merge without mutating kw: the 401 retry below must still carry the
+        # caller's headers (e.g. x-emc-namespace on IAM calls)
+        hdrs = {**self._hdrs(), **(kw.get("headers") or {})}
+        r = self.s.request(method, f"{self.base}{path}",
+                           **{**kw, "headers": hdrs})
         if r.status_code == 401 and retry:  # token expired
             with self._lock:
                 self._token = None
