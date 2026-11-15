@@ -69,6 +69,10 @@ ICEBERG_WAREHOUSE = table_bucket_arn()
 BUCKET_DATA = get("BUCKET_DATA", "poc-spark-data")
 BUCKET_THROTTLE = get("BUCKET_THROTTLE", "poc-throttle")
 DEMO_SCALE_GB = float(get("DEMO_SCALE_GB", "1"))
+# rows of the synthetic orders dataset per DEMO_SCALE_GB unit (measured:
+# reports/environment.md) and the fixed first partition date
+DEMO_ROWS_PER_GB = int(get("DEMO_ROWS_PER_GB", "0") or 0) or 8_000_000
+DEMO_BASE_DATE = get("DEMO_BASE_DATE", "2026-01-01")
 RUN_ID = get("RUN_ID")  # optional fixed run id; default demo-<timestamp>
 SPARK_MASTER = get("SPARK_MASTER", "spark://192.168.1.40:7077")
 SPARK_UI = get("SPARK_UI", "http://192.168.1.40:8080")

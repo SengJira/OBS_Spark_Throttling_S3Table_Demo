@@ -123,3 +123,21 @@ def test_new_run_starts_a_fresh_id(monkeypatch):
 
 def test_new_run_keeps_suite_wide_id():
     assert results.new_run() == "demo-run-a"
+
+
+# ---- demo dataset sizing (#17) ----
+
+def test_rows_scale_with_demo_scale_gb(monkeypatch):
+    from poc import demo_data
+    monkeypatch.setattr(demo_data, "ROWS_PER_GB", 8_000_000)
+    assert demo_data.n_rows_for_scale(1) == 8_000_000
+    assert demo_data.n_rows_for_scale(0.5) == 4_000_000
+    assert demo_data.n_rows_for_scale(2) == 2 * demo_data.n_rows_for_scale(1)
+    assert demo_data.n_rows_for_scale(0) == 1000          # floor
+
+
+def test_base_date_is_fixed_not_today(monkeypatch):
+    from poc import demo_data
+    import datetime
+    monkeypatch.setattr(demo_data.config, "DEMO_BASE_DATE", "2026-01-01")
+    assert demo_data.base_date() == datetime.date(2026, 1, 1)
