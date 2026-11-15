@@ -287,7 +287,7 @@ class LoadGen:
         return self.paused.is_set() or self._tenant_pause[tenant].is_set()
 
     def _noisy_put(self, worker_id):
-        cli = s3util.s3("noisy", timeout_s=self.timeout_s)
+        cli = s3util.s3("noisy", timeout_s=self.timeout_s, max_attempts=1)
         rid = results.run_id()
         while not self._stopped("tenant-noisy"):
             if self._paused("tenant-noisy"):
@@ -296,10 +296,12 @@ class LoadGen:
             key = f"{rid}/noisy/n{seq}.bin"
             tag, ts, t0 = self._cur_tag, time.time(), time.monotonic()
             try:
-                cli.put_object(Bucket=self.bucket, Key=key,
-                               Body=self._payload, ContentLength=self.chunk)
+                r = cli.put_object(Bucket=self.bucket, Key=key,
+                                   Body=self._payload,
+                                   ContentLength=self.chunk)
                 self._rec("tenant-noisy", "PUT", ts,
-                          (time.monotonic()-t0)*1000, STATUS_OK, tag=tag)
+                          (time.monotonic()-t0)*1000, STATUS_OK,
+                          retries=_ok_retries(r), tag=tag)
                 self._key_done(True)
             except Exception as e:
                 self._rec("tenant-noisy", "PUT", ts,
@@ -309,7 +311,7 @@ class LoadGen:
                 time.sleep(0.05)  # brief backoff on throttle/errors
 
     def _critical_get(self, key, interval=0):
-        cli = s3util.s3("critical", timeout_s=self.timeout_s)
+        cli = s3util.s3("critical", timeout_s=self.timeout_s, max_attempts=1)
         while not self._stopped("tenant-critical"):
             if self._paused("tenant-critical"):
                 time.sleep(0.25); continue

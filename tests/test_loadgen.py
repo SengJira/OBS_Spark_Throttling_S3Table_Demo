@@ -14,6 +14,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from botocore.exceptions import ClientError
 from poc import loadgen, s3util, throttle_eval
 
+real_s3 = s3util.s3          # captured before the autouse fixture patches it
+
 
 class FakeBody:
     closed = 0
@@ -44,9 +46,12 @@ class FakeS3:
     ok_retries = 0               # RetryAttempts reported on successful GET
     block_get = None             # threading.Event: GET blocks until set
     latency_s = 0.001
+    put_ok_retries = 0           # RetryAttempts reported on successful PUT
+    created = []                 # (user, kwargs) per client construction
 
     def __init__(self, user="admin", **kw):
         self.user = user
+        FakeS3.created.append((user, kw))
 
     def put_object(self, Bucket, Key, Body=b"", ContentLength=0, **kw):
         time.sleep(FakeS3.latency_s)
@@ -58,7 +63,8 @@ class FakeS3:
             if FakeS3.status_503:
                 raise throttle_error(code=FakeS3.status_503, status=503)
         FakeS3.store[(Bucket, Key)] = bytes(Body)
-        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        return {"ResponseMetadata": {"HTTPStatusCode": 200,
+                                     "RetryAttempts": FakeS3.put_ok_retries}}
 
     def get_object(self, Bucket, Key, **kw):
         if FakeS3.block_get is not None:
@@ -78,6 +84,7 @@ def fake_s3(monkeypatch):
     FakeS3.store, FakeS3.put_calls = {}, []
     FakeS3.throttle_after, FakeS3.status_503 = None, None
     FakeS3.ok_retries, FakeS3.block_get = 0, None
+    FakeS3.put_ok_retries, FakeS3.created = 0, []
     FakeBody.closed = 0
     monkeypatch.setattr(s3util, "s3", lambda *a, **k: FakeS3(*a, **k))
     yield
@@ -164,6 +171,65 @@ def test_retries_captured_on_success_and_failure():
     lg.stop()
     g = lg.phase_stats()["p"].get("tenant-critical GET", {})
     assert g.get("retries_ok", 0) >= 2 and g.get("retries_fail", 0) == 0
+
+
+def test_workers_use_clients_with_retries_disabled():
+    # every server response must be observed raw (#1): no SDK retries
+    lg = loadgen.LoadGen(bucket="b", max_keys=0)
+    lg.start(); time.sleep(0.2); lg.stop()
+    workers = [kw for u, kw in FakeS3.created if "timeout_s" in kw]
+    assert workers and all(kw.get("max_attempts") == 1 for kw in workers)
+
+
+def test_s3_factory_retry_parameter():
+    # real botocore config: default keeps retries, max_attempts=1 disables
+    seen = {}
+    orig = s3util.boto3.client
+    def fake_client(service, **kw):
+        seen["retries"] = kw["config"].retries
+        return object()
+    s3util.boto3.client = fake_client
+    try:
+        s3util.config.USERS.setdefault("admin", ("AK", "SK"))
+        real_s3(max_attempts=1)
+        assert seen["retries"]["max_attempts"] == 1
+        real_s3()
+        assert seen["retries"]["max_attempts"] == s3util.DEFAULT_MAX_ATTEMPTS > 1
+    finally:
+        s3util.boto3.client = orig
+
+
+@pytest.mark.parametrize("code,status,field", [
+    ("SlowDown", 503, "r503_slowdown"),
+    ("SlowDown", 429, "r429"),
+    ("TooManyRequests", 429, "r429"),
+])
+def test_raw_throttle_responses_counted_as_throttled(code, status, field):
+    # with retries off a scripted rejection must surface as throttled, not ok
+    orig = FakeS3.put_object
+    def reject(self, Bucket, Key, Body=b"", ContentLength=0, **kw):
+        if self.user == "noisy":
+            time.sleep(0.001)
+            raise throttle_error(code=code, status=status)
+        return orig(self, Bucket, Key, Body, ContentLength, **kw)
+    FakeS3.put_object = reject
+    try:
+        lg = loadgen.LoadGen(bucket="b", max_keys=0)
+        lg.start(); lg.start_phase("p"); time.sleep(0.4); lg.stop()
+    finally:
+        FakeS3.put_object = orig
+    g = lg.phase_stats()["p"]["tenant-noisy PUT"]
+    assert g["throttled"] == g["n"] > 0 and g["ok"] == 0
+    assert g[field] == g["n"]
+
+
+def test_retries_counted_on_successful_noisy_put():
+    FakeS3.put_ok_retries = 3
+    lg = loadgen.LoadGen(bucket="b", max_keys=0)
+    lg.start(noisy=True, critical=False); lg.start_phase("p")
+    time.sleep(0.3); lg.stop()
+    g = lg.phase_stats()["p"]["tenant-noisy PUT"]
+    assert g["ok"] > 0 and g["retries_ok"] == 3 * g["ok"]
 
 
 def test_noisy_stop_and_restart():
