@@ -111,6 +111,15 @@ class MgmtApi:
 # ---------------- Throttler ----------------
 THROTTLE_STATE = "com.emc.ecs.common.request.throttle.mvp.state"
 THROTTLE_RESPONSE_CODE = "com.emc.ecs.common.request.throttle.mvp.response_code"
+DEMO_RULE_PREFIX = "demo-"
+
+
+class BackupMissing(FileNotFoundError):
+    """The pre-demo throttler backup file does not exist."""
+
+
+class BackupRefused(RuntimeError):
+    """Live throttler state is not a clean pre-demo state."""
 
 
 class Throttler:
@@ -179,24 +188,65 @@ class Throttler:
         r.raise_for_status()
         return r.json()
 
+    # ---- backup / restore ----
+    def snapshot(self):
+        return {"config": self.get_config(), "mode": self.get_mode(),
+                "response_code": self.get_response_code()}
+
     def backup(self, path):
-        import json
-        snap = {
-            "config": self.get_config(),
-            "mode": self.get_mode(),
-            "response_code": self.get_response_code(),
-        }
-        pathlib = __import__("pathlib")
+        """Unconditionally write the live state to `path` (see safe_backup)."""
+        snap = self.snapshot()
         pathlib.Path(path).write_text(json.dumps(snap, indent=2))
         return snap
 
+    def safe_backup(self, path=None, force=False):
+        """Capture the PRE-demo state exactly once.
+
+        Returns ("kept", None) when a backup already exists (never overwritten
+        without `force`), or ("written", snapshot). Raises BackupRefused when
+        the live state is not a clean pre-demo state — demo-* rules present or
+        mode not Disabled — because backing that up would make a later
+        restore() re-apply demo throttling."""
+        path = pathlib.Path(path or config.BACKUP_FILE)
+        if path.exists() and not force:
+            return "kept", None
+        snap = self.snapshot()
+        rules = snap["config"].get("throttle", {}).get("rules", [])
+        demo = [r.get("id") for r in rules
+                if str(r.get("id", "")).startswith(DEMO_RULE_PREFIX)]
+        if not force and (demo or snap["mode"] != "disabled"):
+            raise BackupRefused(
+                f"refusing to back up the throttler: live state is not a clean "
+                f"pre-demo state (mode={snap['mode']}, demo rules={demo}). "
+                f"Restore the real baseline first, or pass --force-backup.")
+        path.write_text(json.dumps(snap, indent=2))
+        return "written", snap
+
     def restore(self, path=None):
-        path = path or config.BACKUP_FILE
-        import json
-        snap = json.loads(__import__("pathlib").Path(str(path)).read_text())
-        self.put_config(snap["config"]["throttle"]["rules"])
+        """Restore the backup: mode -> disabled first (so no half-restored
+        rule set is ever enforced), then the rules, then the original mode
+        and response code."""
+        path = pathlib.Path(str(path or config.BACKUP_FILE))
+        if not path.exists():
+            raise BackupMissing(
+                f"throttler backup {path} not found — nothing restored. "
+                f"Create it with scripts/prep_obs.py while the throttler is "
+                f"in its pre-demo state.")
+        snap = json.loads(path.read_text())
+        self.set_mode("disabled")
+        self.put_config(snap["config"].get("throttle", {}).get("rules", []))
+        self.set_response_code(int(snap["response_code"]))
         self.set_mode(snap["mode"])
-        self.set_response_code(snap["response_code"])
+        return {"mode": snap["mode"], "response_code": snap["response_code"],
+                "rules": len(snap["config"].get("throttle", {}).get("rules", []))}
+
+    def restore_logged(self, path=None):
+        """restore() for atexit handlers: report the error instead of raising."""
+        try:
+            return self.restore(path)
+        except Exception as e:
+            print(f"WARNING: throttler restore failed: {type(e).__name__}: {e}")
+            return None
 
 
 def rule(id, limit_tps, principals=None, verbs=None, actions=None,
