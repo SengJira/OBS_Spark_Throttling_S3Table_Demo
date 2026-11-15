@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Generate the six PoC notebooks in notebooks/. Idempotent."""
-import json, nbformat, pathlib
+"""Generate the six PoC notebooks in notebooks/ (output-free). Idempotent.
 
-NB_DIR = pathlib.Path("/root/OBS/notebooks")
-NB_DIR.mkdir(exist_ok=True)
+The notebooks are build artefacts: change them HERE and regenerate with
+`python3 scripts/gen_notebooks.py` — never hand-edit the .ipynb files.
+"""
+import pathlib, sys
+
+import nbformat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 KERNEL = {"display_name": "PySpark 4.2 (OBS)", "language": "python",
           "name": "pyspark-obs"}
@@ -17,546 +23,1014 @@ def md(src, hidden=False):
 
 
 def py(src):
-    return nbformat.v4.new_code_cell(src)
-
-
-def nb(cells, name):
-    n = nbformat.v4.new_notebook(cells=cells)
-    n.metadata["kernelspec"] = KERNEL
-    n.metadata["language_info"] = {"name": "python", "version": "3.11"}
-    nbformat.write(n, NB_DIR / name)
-    print("wrote", name)
+    return nbformat.v4.new_code_cell(src.strip("\n"))
 
 
 def notes(txt):
     return md(f"**Presenter notes** (hidden)\n\n{txt}", hidden=True)
 
 
-BOOT = '''import pandas as pd
-from IPython.display import HTML, display
-from poc import config, results, viz, s3util
-import poc.spark_helpers as sh
-spark = sh.build_session("obs-poc")
-viz.table(__import__("pandas").DataFrame(sh.versions(spark).items(), columns=["component","version"]))
-print("users:", config.masked_users())
-print("Spark UI:", config.SPARK_UI)'''
+def notebook(cells):
+    n = nbformat.v4.new_notebook(cells=cells)
+    n.metadata["kernelspec"] = KERNEL
+    n.metadata["language_info"] = {"name": "python", "version": "3.11"}
+    return n
 
-# ---------------- 00_smoke ----------------
-nb([
+
+# ---------------------------------------------------------------- 00_smoke
+def nb_00():
+    return notebook([
  md("# 00 — Setup & Smoke Test\n"
-    "**Objective:** prove Spark 4.2 runs on the standalone cluster and the ObjectScale "
-    "PoC environment is configured.\n\n"
+    "**Objective:** prove Spark 4.2 runs on the standalone cluster and the "
+    "ObjectScale PoC environment is configured.\n\n"
     "**Customer sees:** versions, cluster state, and a real Spark job.\n"
     "**TC:** TC0.1"),
  md("## Step 1 — Start the session\n"
-    "Loads `.env`, builds a SparkSession on `spark://192.168.1.40:7077`, prints masked "
-    "credentials and versions."),
- py(BOOT),
- notes("Point out: no secrets printed — all keys masked. Show Spark UI at :8080."),
- md("## Step 2 — Cluster smoke job\n"
-    "`spark.range(10M).count()` runs a real distributed job on the worker and returns "
-    "the count — proves the cluster computes."),
- py('''import time, pandas as pd
+    "Loads `.env`, builds a SparkSession on the standalone master, prints "
+    "the run ID, the identities the session uses, masked credentials and "
+    "versions read from the running components."),
+ py('''
+import time
+import pandas as pd
+from poc import config, results, viz
+import poc.spark_helpers as sh
+
+spark = sh.build_session("obs-poc")
+viz.table(pd.DataFrame(sh.versions(spark).items(), columns=["component", "version"]))
+print("run id:", results.run_id())
+print("session identities:", sh.identities(spark))
+print("users:", config.masked_users())
+'''),
+ notes("Point out: no secrets printed — all keys masked. Versions are read "
+       "live (ObjectScale from the management API, Iceberg from the loaded "
+       "runtime). Spark UI: see the table."),
+ md("## Step 2 — Cluster smoke job (TC0.1)\n"
+    "`spark.range(10M).count()` runs a real distributed job on the worker "
+    "and returns the count — proves the cluster computes."),
+ py('''
 t0 = time.time(); n = spark.range(10_000_000).count(); dt = time.time() - t0
 res = results.write("TC0.1", "spark.range(10M).count()", n == 10_000_000,
                     {"count": n, "seconds": round(dt, 1)})
 viz.table(pd.DataFrame([{"count": n, "seconds": round(dt, 1)}]))
-viz.banner(res["passed"], "TC0.1 smoke", f"{n:,} rows in {dt:.1f}s")
-spark.stop()'''),
- notes("If this is slow, the worker may still be registering — wait a few seconds."),
-], "00_smoke.ipynb")
+viz.banner(res["status"], "TC0.1 smoke", f"{n:,} rows in {dt:.1f}s")
+spark.stop()
+'''),
+ notes("If this is slow, the worker may still be registering — wait a few "
+       "seconds."),
+    ])
 
-# ---------------- 01_spark_on_objectscale ----------------
-nb([
+
+# ------------------------------------------------- 01_spark_on_objectscale
+def nb_01():
+    return notebook([
  md("# 01 — Spark on ObjectScale\n"
-    "**Objective:** Spark 4.2 reads and writes ObjectScale S3 via the S3A connector.\n\n"
-    "**Customer sees:** a partitioned dataset written to OBS, listed in the OBS UI, "
-    "read back and queried.\n**TC:** TC1.1–TC1.6"),
- md("## Step 1 — Session\nBuild SparkSession and print versions (masked creds)."),
- py(BOOT),
- notes("Same session config as the smoke test."),
+    "**Objective:** Spark 4.2 reads and writes ObjectScale S3 via the S3A "
+    "connector.\n\n"
+    "**Customer sees:** a partitioned dataset written to OBS, listed in the "
+    "OBS UI, read back and queried.\n**TC:** TC1.1–TC1.6"),
+ md("## Step 1 — Session\nBuild the SparkSession and print versions "
+    "(masked credentials)."),
+ py('''
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
+from poc import config, demo_data, results, throughput, viz
+import poc.spark_helpers as sh
+
+spark = sh.build_session("obs-poc")
+viz.table(pd.DataFrame(sh.versions(spark).items(), columns=["component", "version"]))
+print("run id:", results.run_id(), "| session identities:", sh.identities(spark))
+'''),
+ notes("Same session configuration as the smoke test — one source of truth "
+       "in poc/spark_helpers.py."),
  md("## Step 2 — Generate the dataset (TC1.1)\n"
-    "Synthetic sales orders (~200k rows, 30 days) generated in Spark — no external data "
-    "needed."),
- py('''from poc import demo_data
+    "Synthetic sales orders generated **on the Spark side** from the row id "
+    "— deterministic, 30 daily partitions from a fixed base date. Row count "
+    "scales with `DEMO_SCALE_GB`."),
+ py('''
+t0 = time.time()
 df = demo_data.orders_df(spark)
-res = results.write("TC1.1", "dataset generated", df.count() > 0,
-                    {"rows": df.count()})
-df.show(5); viz.banner(res["passed"], "TC1.1", f"{res['metrics']['rows']:,} rows")'''),
- notes("Deterministic seed — same data every run."),
+rows = df.count()
+want = demo_data.n_rows_for_scale()
+res = results.write("TC1.1", "dataset generated", rows == want,
+                    {"rows": rows, "expected_rows": want,
+                     "demo_scale_gb": config.DEMO_SCALE_GB,
+                     "base_date": config.DEMO_BASE_DATE,
+                     "seconds": round(time.time() - t0, 1)})
+df.show(5)
+viz.banner(res["status"], "TC1.1",
+           f"{rows:,} rows (DEMO_SCALE_GB={config.DEMO_SCALE_GB:g}), "
+           f"first partition {config.DEMO_BASE_DATE}")
+'''),
+ notes("Every value is a hash of the row id — the same data on every run, "
+       "nothing materialised on the driver. DEMO_SCALE_GB counts "
+       "uncompressed row data; see reports/environment.md for the sizing."),
  md("## Step 3 — Write Parquet partitioned by date (TC1.2)\n"
-    "Data lands in `poc-spark-data/<run_id>/raw/orders` — one partition per order_date. "
-    "Uses the S3A magic committer for atomic writes."),
- py('''import time, pandas as pd
+    "Data lands in `poc-spark-data/<run_id>/raw/orders` — one partition per "
+    "order_date."),
+ py('''
 path = demo_data.data_path()
 t0 = time.time()
 df.write.mode("overwrite").partitionBy("order_date").parquet(path)
-res = results.write("TC1.2", "write partitioned parquet", True,
-                    {"path": path, "seconds": round(time.time() - t0, 1)})
-viz.banner(res["passed"], "TC1.2", f"{res['metrics']['seconds']}s -> {path}")'''),
- notes("Show the Spark UI storage tab / stages during the write."),
+secs = round(time.time() - t0, 1)
+marker, _ = demo_data.list_objects(config.BUCKET_DATA,
+                                   f"{results.run_id()}/raw/orders/_SUCCESS")
+res = results.write("TC1.2", "write partitioned parquet", len(marker) == 1,
+                    {"path": path, "rows": rows, "seconds": secs,
+                     "success_marker": len(marker) == 1})
+viz.banner(res["status"], "TC1.2", f"{res['metrics']['seconds']}s -> {path}")
+'''),
+ notes("Show the Spark UI stages during the write. Parquet uses Spark's "
+       "ParquetOutputCommitter (rename-based) on this cluster; the S3A "
+       "magic committer is active for the other formats (README, 'Spark "
+       "configuration')."),
  md("## Step 4 — Objects on ObjectScale (TC1.3)\n"
-    "List the objects Spark just wrote, then **pause and show the bucket in the "
-    "ObjectScale UI** — same files, visible in the storage console."),
- py('''objs, _ = demo_data.list_objects(config.BUCKET_DATA, f"{results.run_id()}/raw/")
+    "List the objects Spark just wrote, then **pause and show the bucket in "
+    "the ObjectScale UI** — same files, visible in the storage console."),
+ py('''
+objs, total = demo_data.list_objects(config.BUCKET_DATA, f"{results.run_id()}/raw/")
 viz.object_table([(o["Key"], o["Size"]) for o in objs])
-res = results.write("TC1.3", "objects listed in bucket", len(objs) > 0,
-                    {"objects": len(objs)})
-viz.banner(res["passed"], "TC1.3", f"{len(objs)} objects — show OBS UI now")'''),
- notes("UI: https://192.168.1.31 — bucket poc-spark-data, prefix = run_id."),
+res = results.write("TC1.3", "objects listed in bucket", total["objects"] > 0,
+                    {**total, "mib": round(total["bytes"] / 2**20, 1)})
+viz.banner(res["status"], "TC1.3",
+           f"{total['objects']} objects, {total['bytes'] / 2**20:.1f} MiB "
+           f"— show the OBS UI now")
+'''),
+ notes("UI: bucket poc-spark-data, prefix = the run id printed in Step 1."),
  md("## Step 5 — Read back + business queries (TC1.4)\n"
-    "Read the Parquet dataset back and run three business questions as tables/charts: "
+    "Read the Parquet dataset back and answer three business questions: "
     "revenue by day, top customers, orders by status."),
- py('''import matplotlib.pyplot as plt, pandas as pd
-rdf = spark.read.parquet(path).createOrReplaceTempView("orders")
+ py('''
+spark.read.parquet(path).createOrReplaceTempView("orders")
 q1 = spark.sql("SELECT order_date, round(sum(amount*qty),2) rev FROM orders GROUP BY 1 ORDER BY 1").toPandas()
 q2 = spark.sql("SELECT customer, round(sum(amount*qty),2) rev FROM orders GROUP BY 1 ORDER BY rev DESC LIMIT 10").toPandas()
-q3 = spark.sql("SELECT status, count(*) n FROM orders GROUP BY 1").toPandas()
+q3 = spark.sql("SELECT status, count(*) n FROM orders GROUP BY 1 ORDER BY 1").toPandas()
 fig, ax = plt.subplots(1, 2, figsize=(12, 4))
 q1.plot.bar(x="order_date", y="rev", ax=ax[0], legend=False); ax[0].set_title("revenue/day")
 q2.plot.bar(x="customer", y="rev", ax=ax[1], legend=False); ax[1].set_title("top customers")
 res = results.write("TC1.4", "read+queries", len(q1) > 0 and len(q2) > 0,
                     {"days": len(q1), "top": q2.iloc[0].customer})
-viz.table(q3); plt.show(); viz.banner(res["passed"], "TC1.4")'''),
+viz.table(q3); plt.show(); viz.banner(res["status"], "TC1.4")
+'''),
  notes("Queries hit OBS via S3A on every executor."),
  md("## Step 6 — Integrity check (TC1.5)\n"
-    "Count parity between source and stored dataset proves no data loss."),
- py('''src, dst = df.count(), spark.read.parquet(path).count()
+    "Row count and column checksums of the stored dataset must equal the "
+    "source — no data lost or altered."),
+ py('''
+agg = ["count(*) AS n", "sum(qty) AS qty", "round(sum(amount), 2) AS amount"]
+src = df.selectExpr(*agg).first().asDict()
+dst = spark.table("orders").selectExpr(*agg).first().asDict()
 res = results.write("TC1.5", "integrity", src == dst, {"src": src, "dst": dst})
-viz.banner(res["passed"], "TC1.5", f"{src:,} == {dst:,}")'''),
- notes("Parquet column stats + partition pruning also verified implicitly."),
+viz.table(pd.DataFrame([src, dst], index=["source", "stored"]))
+viz.banner(res["status"], "TC1.5", f"{src['n']:,} rows, checksums "
+           f"{'match' if src == dst else 'DIFFER'}")
+'''),
+ notes("Count plus sum(qty) and sum(amount) — a stronger check than a count."),
  md("## Step 7 — Multipart throughput vs concurrency (TC1.6)\n"
-    "Same 256 MiB object uploaded at 1, 2, 4, 8 and 16 parallel part streams — "
-    "shows how concurrency scales sustained write throughput."),
- py('''from poc import throughput
-rows = throughput.multipart_sweep(
+    "Same 256 MiB object uploaded at 1, 2, 4, 8 and 16 parallel part "
+    "streams — shows how concurrency scales sustained write throughput."),
+ py('''
+levels = throughput.multipart_sweep(
     config.BUCKET_THROTTLE, f"{results.run_id()}/multipart",
     levels=(1, 2, 4, 8, 16), total_mb=256, part_mb=16)
-sweep = pd.DataFrame(rows); viz.table(sweep)
-res = results.write("TC1.6", "multipart write concurrency sweep", True,
-                    {"levels": rows, "peak_mbs": max(r["mbs"] for r in rows)})
-viz.banner(res["passed"], "TC1.6",
-           f"peak {res['metrics']['peak_mbs']:.0f} MB/s")'''),
- notes("Objects land under poc-throttle/<run_id>/multipart/ — cleaned by 99_reset."),
+viz.table(pd.DataFrame(levels))
+res = results.write("TC1.6", "multipart write concurrency sweep",
+                    all(r["mbs"] > 0 for r in levels),
+                    {"levels": levels, "peak_mbs": max(r["mbs"] for r in levels)})
+viz.banner(res["status"], "TC1.6", f"peak {res['metrics']['peak_mbs']:.0f} MB/s")
+'''),
+ notes("Objects land under poc-throttle/<run_id>/multipart/ — cleaned by "
+       "99_reset. The client's connection pool is sized for 16 streams."),
  md("## Step 8 — Throughput chart\n"
-    "Throughput vs concurrency from `reports/raw/TC1.6.json` — the ingest-scaling story."),
- py('''import pandas as pd, matplotlib.pyplot as plt
+    "Throughput vs concurrency — the ingest-scaling story."),
+ py('''
 sw = pd.DataFrame(res["metrics"]["levels"]).set_index("concurrency")
 sw.plot.line(y="mbs", marker="o", figsize=(6, 3.5), legend=False)
 plt.xlabel("concurrent part streams"); plt.ylabel("MB/s")
 plt.title("S3 multipart write throughput vs concurrency"); plt.grid(alpha=.3)
 plt.show()
-spark.stop()'''),
- notes("Scaling tapers when a host/NIC limit is hit — expected on a 2-core lab VM."),
-], "01_spark_on_objectscale.ipynb")
+spark.stop()
+'''),
+ notes("Scaling tapers when a host/NIC limit is hit — expected on a 2-core "
+       "lab VM."),
+    ])
 
-# ---------------- 02_s3_throttler ----------------
-nb([
+
+# --------------------------------------------------------- 02_s3_throttler
+def nb_02():
+    return notebook([
  md("# 02 — ObjectScale S3 Throttler\n"
     "**Objective:** validate native S3 throttling — a noisy tenant is capped "
-    "while a critical workload stays inside SLA and recovers.\n\n"
-    "**Customer sees:** four measured phases with verdicts against approved "
-    "thresholds, and a live TPS/latency chart.\n**TC:** TC2.1–TC2.9\n\n"
-    "**Phases:** 1 baseline (critical GET only) → 2 contention (+noisy PUTs, "
-    "dry-run rules) → 3 enforced (429 limit on noisy PUT) → 4 recovery "
-    "(noisy stopped, critical continues).\n\n"
-    "> Caveat: on this lab build rules propagate with a cache delay and "
-    "enforcement may need a datahead reload — verdicts report "
-    "INCONCLUSIVE rather than fabricating throttling (see "
-    "reports/environment.md)."),
+    "while a critical workload stays inside its SLA and recovers.\n\n"
+    "**Customer sees:** measured phases with PASS / FAIL / INCONCLUSIVE "
+    "verdicts against approved thresholds, and a live TPS/latency chart.\n"
+    "**TC:** TC2.1–TC2.11\n\n"
+    "**Flow:** rules are verified and stored first (throttler still "
+    "disabled) so they have fully propagated before enforcement is "
+    "measured → Phase 1 baseline (critical only) → Phase 2 contention "
+    "(+noisy, throttler disabled) → Phase 3 simulation (dry-run) → "
+    "propagation wait → Phase 4 enforcement (HTTP 429) → Phase 5 recovery "
+    "observation (noisy **keeps running**) → prefix-scoped rule → Spark "
+    "write as the throttled tenant → restore.\n\n"
+    "> ObjectScale caches the rule set for up to "
+    "`rules_config_cache_expiration_time` = 300 s (read-only). The notebook "
+    "therefore waits `PROPAGATION_S` (default 300 s) after storing the "
+    "rules before it measures enforcement. A verdict the evidence cannot "
+    "decide is INCONCLUSIVE — never a pass."),
  md("## Step 1 — Session, tenant isolation, effective policy\n"
     "Prove noisy/critical are distinct IAM principals, then **read** the "
-    "current throttler config — rules are never changed outside this "
-    "approved lab workflow."),
- py(BOOT + '''
-import os, json, time
+    "current throttler state. The pre-demo backup must exist before "
+    "anything is changed."),
+ py('''
+import atexit, json, os, time
 import ipywidgets as w
-from poc.loadgen import LoadGen
-from poc.obs_admin import MgmtApi, Throttler
+import pandas as pd
+from IPython.display import HTML, display
+from poc import config, results, viz
 from poc import throttle_eval as te
+from poc.loadgen import LoadGen, put_burst
+from poc.obs_admin import MgmtApi, Throttler
+import poc.spark_helpers as sh
+
+spark = sh.build_session("obs-poc")
+viz.table(pd.DataFrame(sh.versions(spark).items(), columns=["component", "version"]))
 
 PHASE_S = int(os.environ.get("THROTTLE_PHASE_S", "60"))
+PROPAGATION_S = int(os.environ.get("PROPAGATION_S", "300"))
+SETTLE_S = int(os.environ.get("THROTTLE_SETTLE_S", "120"))
 DUR = {"baseline": PHASE_S, "contention": PHASE_S, "simulation": PHASE_S,
-       "enforced": 2 * PHASE_S, "recovery": PHASE_S}
+       "enforced": 2 * PHASE_S, "recovery": PHASE_S,
+       "burst": max(15, PHASE_S // 3)}
+RID = results.run_id()
 
 lg = LoadGen(max_keys=20000)
 iso_rows, iso_ok = lg.verify_tenants()
 viz.table(pd.DataFrame(iso_rows))
-api = MgmtApi(); thr = Throttler(api)
+thr = Throttler(MgmtApi())
 pol = te.effective_policy(thr)
 viz.table(pd.DataFrame([{"mode": pol["mode"], "response_code": pol["response_code"],
-                         "existing_rules": len(pol["rules"])}]))
+                         "existing_rules": len(pol["rules"]),
+                         "backup": str(config.BACKUP_FILE),
+                         "backup_exists": config.BACKUP_FILE.exists()}]))
+if not config.BACKUP_FILE.exists():
+    raise RuntimeError(f"{config.BACKUP_FILE} is missing — run scripts/prep_obs.py "
+                       "while the throttler is in its pre-demo state")
+if pol["mode"] == "enabled":
+    raise RuntimeError("the throttler is already enforcing — this demo must start "
+                       "from mode disabled/dry-run (restore the pre-demo state first)")
+print("run id:", RID, "| phase seconds:", DUR, "| PROPAGATION_S:", PROPAGATION_S)
 viz.banner(iso_ok, "tenant isolation",
-           "distinct principals; effective policy read (unchanged)")'''),
+           "distinct principals; effective policy read (unchanged)")
+'''),
  notes("Shared namespace bucket, separate principals — that is what "
-       "principal-scoped rules discriminate on."),
- md("## Step 2 — Lab rule + schema verification (TC2.2)\n"
-    "The proposed rule: noisy-tenant PUTs capped at 50 TPS, response 429. "
-    "`verify_rule` checks the schema against the live API before anything "
-    "is applied."),
- py('''NOISY_RULE = {"id":"demo-noisy-put","rateUnit":"TPS","isDisabled":False,
-  "filters":{"principals":["urn:ecs:iam::poc:user/tenant-noisy"],
-             "actions":["s3:PutObject"]},
-  "limit":{"value":50},"scoping":{"per":["principal"]}}
-chk = te.verify_rule(thr, NOISY_RULE)
-viz.table(pd.DataFrame([{"schema_ok": chk["ok"],
-                         "problems": "; ".join(chk["problems"]) or "—"}]))
-display(HTML("<pre>"+json.dumps(NOISY_RULE,indent=2)+"</pre>"))
-res = results.write("TC2.2", "rule verified", chk["ok"],
-                    {"rule": NOISY_RULE["id"], "problems": chk["problems"]})
-viz.banner(res["passed"], "TC2.2", "rule schema verified vs live API")'''),
- notes("principals accept user:<name>, iam::user:<id>, or the full IAM URN; "
-       "limit.value is transactions per rateUnit."),
+       "principal-scoped rules discriminate on. LoadGen talks to S3 with "
+       "SDK retries OFF so every 429 is seen as it arrives."),
+ md("## Step 2 — Lab rules: schema verification, then store (TC2.2)\n"
+    "Two rules for the noisy tenant: all PUTs capped at 50 TPS, and a "
+    "tighter 10 TPS cap on one key prefix (`<run_id>/raw/*`). `verify_rule` "
+    "checks both against the schema and the **live** action list. Only "
+    "then are they stored — with the throttler mode left untouched "
+    "(disabled), so nothing is enforced yet. The time of the push starts "
+    "the propagation clock."),
+ py('''
+NOISY = f"urn:ecs:iam::{config.OBS_NAMESPACE}:user/tenant-noisy"
+LIMIT, PREFIX_LIMIT = 50, 10
+COVERED, CONTROL = f"{RID}/raw", f"{RID}/curated"
+NOISY_RULE = {"id": "demo-noisy-put", "rateUnit": "TPS", "isDisabled": False,
+              "filters": {"principals": [NOISY], "actions": ["s3:PutObject"]},
+              "limit": {"value": LIMIT}, "scoping": {"per": ["principal"]}}
+PREFIX_RULE = {"id": "demo-raw-prefix", "rateUnit": "TPS", "isDisabled": False,
+               "filters": {"principals": [NOISY], "actions": ["s3:PutObject"],
+                           "paths": {"matcher": "wildcard", "values": [
+                               f"{config.OBS_NAMESPACE}/{config.BUCKET_THROTTLE}/{COVERED}/*"]}},
+               "limit": {"value": PREFIX_LIMIT}, "scoping": {"per": ["principal"]}}
+checks = {r["id"]: te.verify_rule(thr, r) for r in (NOISY_RULE, PREFIX_RULE)}
+viz.table(pd.DataFrame([{"rule": rid, "schema_ok": c["ok"],
+                         "problems": "; ".join(c["problems"]) or "—"}
+                        for rid, c in checks.items()]))
+display(HTML("<pre>" + json.dumps([NOISY_RULE, PREFIX_RULE], indent=2) + "</pre>"))
+rules_ok = all(c["ok"] for c in checks.values())
+res = results.write("TC2.2", "rules verified against the live schema", rules_ok,
+                    {"rules": {rid: c["problems"] for rid, c in checks.items()}})
+viz.banner(res["status"], "TC2.2", "rule schema + actions verified vs live API")
+if not rules_ok:
+    raise RuntimeError("a rule failed verification — nothing was pushed")
+
+atexit.register(thr.restore_logged)          # restore even if a later cell dies
+keep = [r for r in pol["rules"] if not str(r.get("id", "")).startswith("demo-")]
+thr.put_config(keep + [NOISY_RULE, PREFIX_RULE])
+PUSHED_AT = time.time()
+print(f"rules stored at {time.strftime('%H:%M:%S', time.localtime(PUSHED_AT))} "
+      f"(mode still {thr.get_mode()}); enforcement is measured no earlier than "
+      f"{PROPAGATION_S}s after this push")
+'''),
+ notes("principals accept user:<name>, iam::user:<id>, or the full IAM URN. "
+       "paths are <namespace>/<bucket>/<key-glob>; the wildcard spans '/'. "
+       "The prefix rule is scoped per principal — scoping per 'path' would "
+       "give every object key its own counter. Existing non-demo rules are "
+       "kept in the pushed set."),
  md("## Step 3 — Phase 1: baseline (TC2.1)\n"
-    "Critical GETs alone for DUR[baseline] s — reference TPS, P50/P95/P99."),
- py('''out = w.Output(); display(out)
-seed = lg.start(noisy=False, critical=True)
+    "Critical GETs alone — reference TPS and P50/P95/P99. Rules are stored "
+    "but the throttler is disabled."),
+ py('''
+out = w.Output(); display(out)
+lg.start(noisy=False, critical=True)
 lg.start_phase("baseline")
 chart = viz.LiveChart(lg); chart.mark("baseline")
 chart.refresh(out, seconds=DUR["baseline"])
-bp = lg.phase_stats()["baseline"]["tenant-critical GET"]
-res = results.write("TC2.1", "baseline critical GETs", bp["ok"] > 0,
-    {k: round(bp[k],2) for k in ("n","tps","p50","p95","p99","errors")})
-viz.banner(res["passed"], "TC2.1 baseline",
-           f"{bp['tps']:.1f} TPS, p95 {bp['p95']:.0f} ms, p99 {bp['p99']:.0f} ms")'''),
- notes("Critical workload alone — rules exist but stay disabled."),
- md("## Step 4 — Phase 2: contention, no rules (TC2.3)\n"
-    "Noisy PUTs added on top of critical GETs, **no throttling configured** — "
-    "the pure offered-load impact this demo must fix."),
- py('''lg.add_noisy(threads=6); lg.start_phase("contention"); chart.mark("contention")
+bp = lg.phase_stats()["baseline"].get("tenant-critical GET", {})
+res = results.write("TC2.1", "baseline critical GETs",
+                    bp.get("ok", 0) >= 50 and bp.get("errors", 0) == 0,
+                    {k: round(bp.get(k, 0), 2) for k in ("n", "tps", "p50", "p95", "p99", "errors")})
+viz.banner(res["status"], "TC2.1 baseline",
+           f"{bp.get('tps', 0):.1f} TPS, p95 {bp.get('p95', 0):.0f} ms, "
+           f"p99 {bp.get('p99', 0):.0f} ms")
+'''),
+ notes("Critical workload alone — the reference everything else is "
+       "compared with."),
+ md("## Step 4 — Phase 2: contention, throttler disabled (TC2.3)\n"
+    "Noisy PUTs are added on top of the critical GETs. The throttler is "
+    "still disabled, so this is the unprotected impact the rule must fix."),
+ py('''
+lg.start_phase("contention"); chart.mark("contention"); lg.add_noisy(threads=6)
 chart.refresh(out, seconds=DUR["contention"])
 ps_all = lg.phase_stats()
-b, c = ps_all["baseline"], ps_all["contention"]
-bl, ct = b["tenant-critical GET"], c["tenant-critical GET"]
-res = results.write("TC2.3", "contention", ct["ok"] > 0,
-    {"baseline_p95": round(bl["p95"],1), "contention_p95": round(ct["p95"],1),
-     "contention_p99": round(ct["p99"],1),
-     "offered_noisy_tps": round(c.get("tenant-noisy PUT",{}).get("tps",0),1),
-     "noisy_ok_tps": round(c.get("tenant-noisy PUT",{}).get("ok",0)/
-                           max(1e-9,c["_window"]["seconds"]),1)})
-viz.banner(res["passed"], "TC2.3 contention",
-           f"critical p95 {bl['p95']:.0f} -> {ct['p95']:.0f} ms")'''),
+c = ps_all["contention"]
+bl = ps_all["baseline"].get("tenant-critical GET", {})
+ct, cn = c.get("tenant-critical GET", {}), c.get("tenant-noisy PUT", {})
+if min(ct.get("n", 0), cn.get("n", 0)) < 50:
+    st3, why3 = "FAIL", "too few requests in the contention phase"
+elif cn.get("throttled", 0):
+    st3, why3 = "FAIL", f"{cn['throttled']} throttle responses while the throttler is disabled"
+else:
+    st3, why3 = "PASS", (f"critical p95 {bl.get('p95', 0):.0f} -> {ct.get('p95', 0):.0f} ms "
+                         f"with {cn.get('tps', 0):.0f} noisy PUT/s")
+res = results.write("TC2.3", "contention (throttler disabled)", status=st3, detail=why3,
+    metrics={"baseline_p95": round(bl.get("p95", 0), 1),
+             "contention_p95": round(ct.get("p95", 0), 1),
+             "contention_p99": round(ct.get("p99", 0), 1),
+             "critical_tps": round(ct.get("tps", 0), 1),
+             "noisy_ok_tps": round(cn.get("ok", 0) / max(1e-9, c["_window"]["seconds"]), 1),
+             "noisy_throttled": cn.get("throttled", 0), "mode": thr.get_mode(),
+             "client_cpu_pct": {"baseline": ps_all["baseline"]["_window"]["client_cpu_pct"],
+                                "contention": c["_window"]["client_cpu_pct"]}})
+viz.banner(st3, "TC2.3 contention", why3)
+'''),
  notes("Unrestricted noisy PUTs degrade critical latency — the problem "
-       "statement. No rules active yet."),
+       "statement. Caveat for this lab: both tenants are driven from one "
+       "2-vCPU client host, and a CPU-only disturbance on that host (no S3 "
+       "traffic) degrades the critical GETs just as much — so the size of "
+       "this effect cannot be attributed to ObjectScale alone "
+       "(reports/environment.md, 'Client-side contention'). client_cpu_pct "
+       "is recorded per phase."),
  md("## Step 5 — Phase 3: simulation mode, dry-run (TC2.10)\n"
-    "Rule pushed with mode **dry-run** (ObjectScale Simulation Mode). Both "
-    "workloads continue — the client must see **zero** rejections while the "
-    "server only counts matches."),
- py('''thr.put_config([NOISY_RULE]); thr.set_mode("dryrun")
+    "Mode **dry-run** (ObjectScale simulation mode): the server only counts "
+    "rule matches. Both workloads continue — the client must see **zero** "
+    "throttle responses."),
+ py('''
+thr.set_mode("dryrun")
 lg.start_phase("simulation"); chart.mark("simulation (dry-run)")
 chart.refresh(out, seconds=DUR["simulation"])
 sp = lg.phase_stats()["simulation"]
 sn = sp.get("tenant-noisy PUT", {})
 srv_sim = te.server_counters(thr)
-sim_clean = sn.get("throttled", 0) == 0 and sn.get("errors", 0) == 0
-res = results.write("TC2.10", "simulation mode", sim_clean,
-    {"client_429_or_slowdown": sn.get("throttled",0),
-     "client_errors": sn.get("errors",0),
-     "noisy_ok_tps": round(sn.get("ok",0)/max(1e-9,sp["_window"]["seconds"]),1),
-     "mode": thr.get_mode(),
-     "server_metrics_available": srv_sim["available"]})
-viz.banner(res["passed"], "TC2.10 simulation",
-           "0 client rejections — dry-run matches are server-side only"
-           if sim_clean else "client saw rejections in dry-run!")'''),
- notes("Dry-run validates rule matching safely: client sees only 200s; "
-       "simulated-match counters are a server-side concept — probed and "
-       "reported, never fabricated."),
- md("## Step 5 — Phase 3: enforcement, HTTP 429 (TC2.4)\n"
-    "Mode enabled with 429 responses; both workloads continue for "
-    "DUR[enforced] s. Mid-phase check confirms noisy load stays sustained."),
- py('''thr.set_mode("enabled"); thr.set_response_code(429)
-time.sleep(2)  # allow config write to settle before readback
+if sn.get("n", 0) < 50:
+    st10, why10 = "INCONCLUSIVE", "too few noisy requests in the simulation phase"
+elif sn.get("throttled", 0):
+    st10, why10 = "FAIL", f"{sn['throttled']} client throttle responses in dry-run"
+else:
+    st10, why10 = "PASS", (f"0 throttle responses in {sn['n']} noisy requests "
+                           f"({sn.get('errors', 0)} other errors)")
+res = results.write("TC2.10", "simulation mode (dry-run)", status=st10, detail=why10,
+    metrics={"client_throttle_responses": sn.get("throttled", 0),
+             "client_other_errors": sn.get("errors", 0),
+             "noisy_ok_tps": round(sn.get("ok", 0) / max(1e-9, sp["_window"]["seconds"]), 1),
+             "mode": thr.get_mode(),
+             "server_metrics_available": srv_sim["available"]})
+viz.banner(st10, "TC2.10 simulation", why10)
+'''),
+ notes("Dry-run validates rule matching safely. Simulated-match counters "
+       "are a server-side concept: they are probed and reported as "
+       "unavailable when the build does not expose them — never invented."),
+ md("## Step 6 — Wait for rule propagation\n"
+    "ObjectScale caches the rule set for up to 300 s. Both workloads keep "
+    "running (still dry-run) until `PROPAGATION_S` has passed since the "
+    "rules were stored. This time is tagged as its own phase, "
+    "`propagation`, so it does not pollute the measured phases."),
+ py('''
+lg.start_phase("propagation"); chart.mark("propagation wait")
+countdown = w.HTML(); display(countdown)
+while (left := PROPAGATION_S - (time.time() - PUSHED_AT)) > 0:
+    countdown.value = (f"<b>rule propagation: {left:.0f}s left</b> of {PROPAGATION_S}s "
+                       f"since the rules were stored (load keeps running, dry-run)")
+    chart.refresh(out, seconds=min(10, left))
+RULE_AGE_S = round(time.time() - PUSHED_AT, 1)
+countdown.value = f"<b>rules are {RULE_AGE_S:.0f}s old</b> — propagation wait complete"
+print(f"rules stored {RULE_AGE_S:.0f}s ago (>= PROPAGATION_S={PROPAGATION_S}s) — "
+      f"enforcement can now be measured")
+'''),
+ notes("The countdown is live in JupyterLab; headless runs print the final "
+       "line. With the default 60 s phases roughly 120 s are spent here."),
+ md("## Step 7 — Phase 4: enforcement, HTTP 429 (TC2.4)\n"
+    "Mode **enabled**, response code 429. The switch is read back, the "
+    "notebook waits until the new mode is visibly in effect (tagged "
+    "`switching`), then measures the `enforced` phase with both workloads "
+    "running. The status is computed: PASS needs an enforcement signature "
+    "**and** an accepted noisy rate within the limit."),
+ py('''
+thr.set_response_code(429); thr.set_mode("enabled")
+time.sleep(2)                                   # let the config write settle
 eff = {"mode": thr.get_mode(), "response_code": thr.get_response_code(),
-       "rules": len(thr.get_rules())}
+       "rules": [r.get("id") for r in thr.get_rules()]}
 assert eff["mode"] == "enabled" and eff["response_code"] == 429, eff
-lg.start_phase("enforced"); chart.mark("enforce 429")
+lg.start_phase("switching"); chart.mark("mode -> enabled")
+t_eff = te.wait_effective(lg, LIMIT, timeout_s=SETTLE_S)
+print("mode switch visible after", t_eff, "s" if t_eff is not None
+      else f"— NOT visible within {SETTLE_S}s; measuring anyway")
+
+lg.start_phase("enforced"); chart.mark("enforced (429)")
 half = DUR["enforced"] // 2
 chart.refresh(out, seconds=half)
-sustained_mid = lg.sustained(10, 0.5)
-if lg.running("tenant-noisy") and not sustained_mid:
-    viz.banner(False, "sustained check", "noisy load dropped — extending watch")
+sustained_mid = lg.sustained(10, LIMIT * 0.25)
 chart.refresh(out, seconds=DUR["enforced"] - half)
-sustained_end = lg.sustained(10, 0.5)
+sustained_end = lg.sustained(10, LIMIT * 0.25)
+
 ps_all = lg.phase_stats()
 ep, cp = ps_all["enforced"], ps_all["contention"]
 en, ec = ep.get("tenant-noisy PUT", {}), ep.get("tenant-critical GET", {})
-cn = cp.get("tenant-noisy PUT", {})
-lim_v = NOISY_RULE["limit"]["value"]
-enforced, enf_mode = te.detect(ps_all, lim_v)
-data_ok = en.get("n", 0) >= 50 and ec.get("n", 0) >= 50
-res = results.write("TC2.4", "enforcement", data_ok,
-    {"noisy": {k: round(en.get(k,0),2) for k in
-               ("n","tps","ok","throttled","r429","r503_slowdown","r503_other",
-                "errors","retries_ok","retries_fail","boundary",
-                "p50","p95","p99")},
-     "noisy_ok_tps_before": round(cn.get("ok",0)/max(1e-9,cp.get("_window",{}).get("seconds",1)),1),
-     "noisy_ok_tps_enforced": round(en.get("ok",0)/max(1e-9,ep.get("_window",{}).get("seconds",1)),1),
-     "codes": en.get("codes", {}),
-     "critical_p95": round(ec.get("p95",0),1),
-     "critical_p99": round(ec.get("p99",0),1),
-     "sustained_mid": sustained_mid, "sustained_end": sustained_end,
-     "effective_config": eff,
-     "enforcement_active": enforced, "enforcement_mode": enf_mode})
-viz.banner(enforced, "TC2.4",
-           f"enforcement active — {enf_mode} mode" if enforced
-           else "no enforcement signature (rejects or delay) — rule may "
-                "still be propagating (≤5 min cache)")'''),
- notes("This build throttles by request delay: all 200s, ok_tps pinned at the "
-       "limit, noisy latency spikes — verdicts detect both modes."),
- md("## Step 7 — Phase 5: continued recovery observation (TC2.5)\n"
-    "**No configuration change here** — enforcement from Step 6 stays "
-    "active; this phase simply keeps measuring. Noisy PUTs continue at the "
-    "same offered rate, the rule keeps capping them, and we observe whether "
-    "critical latency holds at recovery level. Throttle events on the noisy "
-    "side are expected to stay elevated."),
- py('''lg.start_phase("recovery"); chart.mark("recovery (enforcement continues)")
+st4, why4, enforced, enf_mode = te.tc24_status(
+    ps_all, LIMIT, sustained=sustained_mid and sustained_end)
+sig = te.signals(ps_all, LIMIT)
+res = results.write("TC2.4", "enforcement (HTTP 429)", status=st4, detail=why4,
+    metrics={"noisy": {k: round(en.get(k, 0), 2) for k in
+                       ("n", "ok", "throttled", "r429", "r503_slowdown", "r503_other",
+                        "errors", "retries_ok", "retries_fail", "boundary",
+                        "ok_p50", "ok_p95", "ok_p99", "fail_p50", "fail_p95")},
+             "noisy_ok_tps_before": round(sig["ok_tps_before"], 1),
+             "noisy_ok_tps_enforced": round(sig["ok_tps"], 1),
+             "limit_tps": LIMIT, "codes": en.get("codes", {}),
+             "critical_tps": round(ec.get("tps", 0), 1),
+             "critical_p95": round(ec.get("p95", 0), 1),
+             "critical_p99": round(ec.get("p99", 0), 1),
+             "critical_throttled": ec.get("throttled", 0),
+             "critical_errors": ec.get("errors", 0),
+             "sustained_mid": sustained_mid, "sustained_end": sustained_end,
+             "rule_age_at_enable_s": RULE_AGE_S, "seconds_to_effect": t_eff,
+             "effective_config": eff,
+             "enforcement_active": enforced, "enforcement_mode": enf_mode})
+viz.banner(st4, "TC2.4 enforcement", why4)
+'''),
+ notes("With client retries off ObjectScale shows both mechanisms: it "
+       "queues requests to hold the accepted rate at the limit (latency "
+       "tail grows) and rejects the overflow with 429 TooManyRequests. "
+       "codes{} lists the S3 error codes exactly as received."),
+ md("## Step 8 — Phase 5: continued recovery observation (TC2.5)\n"
+    "**No configuration change here** — enforcement from Step 7 stays "
+    "active and this phase simply keeps measuring. Noisy PUTs continue at "
+    "the same offered rate, the rule keeps capping them, and we observe "
+    "whether critical latency holds near baseline. Throttle responses on "
+    "the noisy side are expected to stay elevated."),
+ py('''
+lg.start_phase("recovery"); chart.mark("recovery (enforcement continues)")
 chart.refresh(out, seconds=DUR["recovery"])
-rp = lg.phase_stats()["recovery"]
+ps_all = lg.phase_stats()
+rp = ps_all["recovery"]
 rc, rn = rp.get("tenant-critical GET", {}), rp.get("tenant-noisy PUT", {})
 rec_span = max(1e-9, rp["_window"]["seconds"])
+verdicts = te.evaluate(ps_all, rule=NOISY_RULE)
+REC_CHECKS = {"recovery_p95_vs_baseline", "noisy_sustained_in_recovery",
+              "critical_not_throttled"}
+st5 = te.combine(verdicts["verdicts"], REC_CHECKS)
+why5 = "; ".join(f"{v['name']}={v['verdict']}" for v in verdicts["verdicts"]
+                 if v["name"] in REC_CHECKS)
 res = results.write("TC2.5", "recovery observation under sustained throttling",
-    rc.get("ok",0) > 0 and rn.get("n",0) > 0,
-    {"critical_p95": round(rc.get("p95",0),1),
-     "critical_p99": round(rc.get("p99",0),1),
-     "critical_errors": rc.get("errors",0),
-     "critical_throttled": rc.get("throttled",0),
-     "noisy_offered_tps": round(rn.get("n",0)/rec_span,1),
-     "noisy_throttled": rn.get("throttled",0),
-     "noisy_ok_tps": round(rn.get("ok",0)/rec_span,1)})
-viz.banner(res["passed"], "TC2.5 recovery",
-           f"critical p95 {rc.get('p95',0):.0f} ms; noisy still offering "
-           f"{rn.get('n',0)/rec_span:.0f} TPS")'''),
- notes("The mechanism is already-running enforcement, observed longer — "
-       "not a second action. Elevated noisy throttle events are expected."),
- md("## Step 8 — Restart safety check\n"
-    "Stop and restart the noisy group once to prove it is safely "
-    "restartable, then leave it stopped for the remaining steps."),
- py('''leftover = lg.stop_noisy()
+    status=st5, detail=why5,
+    metrics={"baseline_p95": round(ps_all["baseline"].get("tenant-critical GET", {}).get("p95", 0), 1),
+             "contention_p95": round(ps_all["contention"].get("tenant-critical GET", {}).get("p95", 0), 1),
+             "critical_p95": round(rc.get("p95", 0), 1),
+             "critical_p99": round(rc.get("p99", 0), 1),
+             "critical_tps": round(rc.get("tps", 0), 1),
+             "critical_errors": rc.get("errors", 0),
+             "critical_throttled": rc.get("throttled", 0),
+             "noisy_offered_tps": round(rn.get("n", 0) / rec_span, 1),
+             "noisy_ok_tps": round(rn.get("ok", 0) / rec_span, 1),
+             "noisy_throttled": rn.get("throttled", 0),
+             "client_cpu_pct": {ph: ps_all[ph]["_window"]["client_cpu_pct"]
+                                for ph in ("baseline", "contention", "enforced", "recovery")},
+             "recovery_p95_dev_factor": verdicts["thresholds"]["recovery_p95_dev_factor"],
+             "checks": {v["name"]: v["detail"] for v in verdicts["verdicts"]
+                        if v["name"] in REC_CHECKS}})
+viz.banner(st5, "TC2.5 recovery",
+           f"critical p95 {rc.get('p95', 0):.0f} ms (baseline "
+           f"{res['metrics']['baseline_p95']:.0f}, contention "
+           f"{res['metrics']['contention_p95']:.0f}); noisy still offering "
+           f"{rn.get('n', 0) / rec_span:.0f} req/s")
+'''),
+ notes("The mechanism is the already-running enforcement, observed longer "
+       "— not a second action. The rule still admits ~50 noisy PUT/s by "
+       "design, so the critical workload shares the system with that "
+       "admitted load; the recovery threshold is the customer's to set "
+       "(te.DEFAULT_THRESHOLDS)."),
+ md("## Step 9 — Prefix-scoped rule (TC2.6)\n"
+    "The second rule caps the noisy tenant at 10 TPS under "
+    "`<run_id>/raw/*` only. Real traffic decides: the main noisy load is "
+    "paused, then the same tenant sends one PUT burst to the covered prefix "
+    "and one to a control prefix (`<run_id>/curated/`). PASS only if the "
+    "covered prefix is held at its limit while the control prefix runs "
+    "clearly above it (it stays under the tenant-wide 50 TPS rule)."),
+ py('''
+lg.pause_noisy(); time.sleep(3)
+lg.start_phase("prefix-test"); chart.mark("prefix bursts")
+cov = put_burst("noisy", config.BUCKET_THROTTLE, COVERED, seconds=DUR["burst"], threads=4)
+ctl = put_burst("noisy", config.BUCKET_THROTTLE, CONTROL, seconds=DUR["burst"], threads=4)
+pfx = te.evaluate_prefix(cov, ctl, PREFIX_LIMIT)
+stored = [r.get("id") for r in thr.get_rules()]
+if PREFIX_RULE["id"] not in stored:
+    pfx = {"status": "FAIL", "reason": f"prefix rule not stored on the server: {stored}"}
+cols = ("n", "ok", "ok_tps", "throttled", "r429", "errors", "ok_p95", "seconds")
+viz.table(pd.DataFrame([{"prefix": "covered  " + COVERED, **{k: round(cov[k], 1) for k in cols}},
+                        {"prefix": "control  " + CONTROL, **{k: round(ctl[k], 1) for k in cols}}]))
+res = results.write("TC2.6", "prefix-scoped rule", status=pfx["status"], detail=pfx["reason"],
+    metrics={"prefix_limit_tps": PREFIX_LIMIT, "tenant_limit_tps": LIMIT,
+             "rule_path": PREFIX_RULE["filters"]["paths"]["values"][0],
+             "covered": {k: round(cov[k], 1) for k in cols},
+             "control": {k: round(ctl[k], 1) for k in cols},
+             "covered_codes": cov["codes"], "control_codes": ctl["codes"]})
+viz.banner(pfx["status"], "TC2.6 prefix rule", pfx["reason"])
+lg.resume_noisy()
+'''),
+ notes("Both bursts use the tenant-noisy identity with retries off. The "
+       "control prefix is still subject to the tenant-wide rule, so it is "
+       "expected near 50 TPS, the covered prefix near 10."),
+ md("## Step 10 — Spark write as the throttled tenant (TC2.7)\n"
+    "The same Spark job runs twice while the noisy load keeps the tenant at "
+    "its limit: first as **poc-admin** (not targeted by the rule), then — "
+    "in a session rebuilt with the **tenant-noisy** S3A identity — under "
+    "the enforced rule. PASS: the throttled job completes and throttling "
+    "was demonstrably active while it ran."),
+ py('''
+lg.start_phase("spark-write"); chart.mark("spark writes")
+
+def spark_write(session, label):
+    target = f"{RID}/spark-write-{label}"
+    t0 = time.time()
+    session.range(200_000).repartition(20).write.mode("overwrite").json(
+        f"s3a://{config.BUCKET_THROTTLE}/{target}")
+    return round(time.time() - t0, 1), target
+
+t_admin, _ = spark_write(spark, "admin")
+spark.stop()
+spark = sh.build_session("obs-poc-noisy", s3a_user="noisy")
+ident = sh.identities(spark)
+t_start = time.time()
+try:
+    t_noisy, target = spark_write(spark, "noisy"); job_error = None
+except Exception as e:
+    t_noisy, target, job_error = None, f"{RID}/spark-write-noisy", str(e).splitlines()[0][:300]
+during = lg.snapshot(since=t_start).get("tenant-noisy", {}).get("PUT", {})
+s3a_stats = sh.s3a_committer_stats(config.BUCKET_THROTTLE, target) if not job_error else {}
+s3a_throttled = sum(v for k, v in s3a_stats.items()
+                    if "throttl" in k and isinstance(v, (int, float)))
+mode_now = thr.get_mode()
+if job_error:
+    st7, why7 = "FAIL", f"Spark write as tenant-noisy failed: {job_error}"
+elif ident["s3a"] != "noisy":
+    st7, why7 = "FAIL", f"session S3A identity is {ident['s3a']}, not tenant-noisy"
+elif mode_now != "enabled" or not (during.get("throttled", 0) or s3a_throttled):
+    st7, why7 = "INCONCLUSIVE", (f"job completed in {t_noisy}s, but no throttling was "
+                                 f"observed for tenant-noisy while it ran (mode={mode_now})")
+else:
+    st7, why7 = "PASS", (f"completed under enforcement in {t_noisy}s vs {t_admin}s as "
+                         f"poc-admin ({t_noisy / max(t_admin, 0.1):.1f}x); "
+                         f"{during.get('throttled', 0)} tenant-noisy 429s during the job")
+res = results.write("TC2.7", "spark write as throttled tenant", status=st7, detail=why7,
+    metrics={"seconds_admin_unthrottled": t_admin, "seconds_noisy_throttled": t_noisy,
+             "slowdown": round(t_noisy / max(t_admin, 0.1), 2) if t_noisy else None,
+             "s3a_identity": ident["s3a"], "s3a_key": ident["s3a_key"],
+             "mode": mode_now,
+             "tenant_noisy_429_during_job": during.get("throttled", 0),
+             "tenant_noisy_ok_tps_during_job": round(
+                 during.get("ok", 0) / max(1e-9, time.time() - t_start), 1),
+             "s3a_committer_stats": s3a_stats})
+viz.table(pd.DataFrame([{"identity": "poc-admin (not in the rule)", "seconds": t_admin},
+                        {"identity": "tenant-noisy (rule enforced)", "seconds": t_noisy}]))
+viz.banner(st7, "TC2.7 Spark under throttling", why7)
+'''),
+ notes("The S3A identity is set per session (fs.s3a.access.key), verified "
+       "by build_session. S3A retries throttled requests "
+       "(fs.s3a.retry.throttle.*), so the job slows down instead of "
+       "failing. The 429 count is the tenant's LoadGen view during the "
+       "job; S3A's own counters are shown when the committer reports them."),
+ md("## Step 11 — Stop the load: worker lifecycle (TC2.11)\n"
+    "Stop and restart the noisy group once to prove it restarts safely, "
+    "then stop every worker."),
+ py('''
+leftover = lg.stop_noisy()
 restarted = lg.add_noisy(1) == 1
 time.sleep(3)
 restarted = restarted and lg.running("tenant-noisy")
-leftover += lg.stop_noisy()
-res = results.write("TC2.11", "worker lifecycle",
-                    restarted and leftover == 0,
-                    {"noisy_restartable": restarted,
-                     "lingering_workers": leftover})
-viz.banner(res["passed"], "worker lifecycle",
+leftover += lg.stop()
+res = results.write("TC2.11", "worker lifecycle", restarted and leftover == 0,
+                    {"noisy_restartable": restarted, "lingering_workers": leftover})
+viz.banner(res["status"], "TC2.11 worker lifecycle",
            "restart ok, no lingering workers" if res["passed"]
-           else "worker lifecycle problem")'''),
- md("## Step 9 — Verdicts + server-side correlation (TC2.9)\n"
-    "Score all phases against the approved thresholds; correlate client-side "
-    "429s with ObjectScale server counters where the build exposes them."),
- py('''verdicts = te.evaluate(lg.phase_stats(), rule=NOISY_RULE)
+           else f"restartable={restarted}, lingering={leftover}")
+'''),
+ notes("stop() joins every worker; a worker that outlives its join timeout "
+       "is kept in the count instead of being forgotten."),
+ md("## Step 12 — Verdicts + server-side correlation (TC2.9)\n"
+    "Score all phases against the approved thresholds and correlate the "
+    "client-side throttle responses with ObjectScale's own counters where "
+    "the build exposes them. The status **is** the overall verdict — "
+    "INCONCLUSIVE is not a pass."),
+ py('''
+ps_all = lg.phase_stats()
+verdicts = te.evaluate(ps_all, rule=NOISY_RULE)
 srv = te.server_counters(thr)
 rows = [{"check": v["name"], "verdict": v["verdict"], "detail": v["detail"]}
         for v in verdicts["verdicts"]]
-viz.table(pd.DataFrame(rows))
-corr = {"client_throttled": sum(v.get("throttled",0) for v in
-            lg.phase_stats().get("enforced",{}).values() if isinstance(v,dict)),
+display(pd.DataFrame(rows).style.apply(viz.status_style, column="verdict", axis=1))
+corr = {"client_throttled_enforced_phase": ps_all.get("enforced", {}).get(
+            "tenant-noisy PUT", {}).get("throttled", 0),
         "server_metrics_available": srv["available"], "probed": srv["probed"]}
 if srv["available"]:
     corr["server_data"] = srv["data"]
 else:
-    print("server-side throttle metrics not exposed on this build — "
+    print("server-side throttle counters are not exposed on this build — "
           "client-side observations only")
-res = results.write("TC2.9", "verdicts + correlation",
-                    verdicts["overall"] != "FAIL",
-                    {"overall": verdicts["overall"], "verdicts": rows, **corr})
-viz.banner(verdicts["overall"] != "FAIL", "overall verdict",
-           verdicts["overall"])'''),
- notes("A 50 TPS limit does not yield exactly 50 ok/s — enforcement windows, "
-       "bursts and retries shift observed rates; thresholds carry tolerance."),
- md("## Step 10 — Phase summary\n"
-    "All four phases side by side: TPS, latencies, throttled, errors, codes."),
- py('''rows = [{"phase": ph, "workload": k, "n": v["n"], "tps": round(v["tps"],1),
-          "p50": round(v["p50"],0), "p95": round(v["p95"],0),
-          "p99": round(v["p99"],0), "throttled": v["throttled"],
-          "errors": v["errors"], "retries": v["retries"]}
-         for ph, gs in lg.phase_stats().items()
-         for k, v in gs.items() if k != "_window"]
-viz.table(pd.DataFrame(rows))
-chart.refresh(out, seconds=2)'''),
- notes("Shaded bands mark closed phases — the four-phase story in one chart."),
- md("## Step 11 — Prefix-scoped rule (TC2.6)\n"
-    "A second rule limits `raw/*` writes only — other prefixes unaffected."),
- py('''PRE = dict(NOISY_RULE, id="demo-raw-prefix",
-   filters={"principals":["urn:ecs:iam::poc:user/tenant-noisy"],"actions":["s3:PutObject"],
-            "paths":{"matcher":"wildcard","values":["poc/poc-throttle/raw/*"]}},
-   scoping={"per":["principal","path"]})
-thr.put_config([NOISY_RULE, PRE]); chart.mark("prefix rule")
-rules = thr.get_rules()
-res = results.write("TC2.6", "prefix rule", len(rules) == 2, {"rules": len(rules)})
-viz.table(pd.DataFrame(rules)[["id","rateUnit"]]); viz.banner(res["passed"], "TC2.6")'''),
- notes("paths values are <namespace>/<bucket>/<key-glob>."),
- md("## Step 12 — Stop load, Spark write under rules (TC2.7)\n"
-    "Stop the generator and time a Spark write as tenant-noisy under the "
-    "active rules."),
- py('''leftover = lg.stop()
-import time as T
-t0 = T.time()
-spark.range(100_000).write.mode("overwrite").json(
-    f"s3a://{config.BUCKET_THROTTLE}/{results.run_id()}/throttled-write")
-res = results.write("TC2.7", "spark write under rules", leftover == 0,
-                    {"seconds": round(T.time() - t0, 1),
-                     "lingering_workers": leftover})
-viz.banner(res["passed"], "TC2.7", f"{res['metrics']['seconds']}s")'''),
- notes("With enforcement active, S3A's throttle retry policy absorbs 429s."),
- md("## Step 13 — Restore\n"
-    "Guaranteed restore of the pre-demo throttler backup — registered at "
-    "exit as well."),
- py('''import atexit
-atexit.register(thr.restore)
+res = results.write("TC2.9", "verdicts + correlation", status=verdicts["overall"],
+                    metrics={"overall": verdicts["overall"],
+                             "enforcement_mode": verdicts["enforcement_mode"],
+                             "thresholds": verdicts["thresholds"],
+                             "verdicts": rows, **corr})
+viz.banner(verdicts["overall"], "TC2.9 overall verdict",
+           f"enforcement mode: {verdicts['enforcement_mode']}")
+'''),
+ notes("A 50 TPS limit does not yield exactly 50 ok/s — the thresholds "
+       "carry a stated tolerance. They are customer-approved values in "
+       "te.DEFAULT_THRESHOLDS, not tuned to the result."),
+ md("## Step 13 — Phase summary\n"
+    "Every phase side by side: request counts, TPS, latencies, throttle "
+    "responses, errors."),
+ py('''
+summary = [{"phase": ph, "client_cpu_pct": gs["_window"]["client_cpu_pct"],
+            "workload": k, "n": v["n"], "tps": round(v["tps"], 1),
+            "ok_p50": round(v["ok_p50"]), "ok_p95": round(v["ok_p95"]),
+            "ok_p99": round(v["ok_p99"]), "throttled": v["throttled"],
+            "r429": v["r429"], "errors": v["errors"], "boundary": v["boundary"]}
+           for ph, gs in ps_all.items() for k, v in gs.items() if k != "_window"]
+viz.table(pd.DataFrame(summary))
+chart.refresh(out, seconds=2)
+'''),
+ notes("client_cpu_pct = CPU utilisation of the load-generator host in "
+       "that phase. Shaded bands mark the phases; the dotted line is the throttled "
+       "(429) rate. `boundary` counts requests that were still in flight "
+       "when their phase ended."),
+ md("## Step 14 — Restore (TC2.8)\n"
+    "Restore the pre-demo throttler backup and verify the live state "
+    "against the backup file — mode, response code and rule IDs."),
+ py('''
+backup = json.loads(config.BACKUP_FILE.read_text())
+want = {"mode": backup["mode"], "response_code": int(backup["response_code"]),
+        "rules": sorted(r.get("id") for r in backup["config"].get("throttle", {}).get("rules", []))}
 thr.restore()
-res = results.write("TC2.8", "restore", thr.get_mode() == "disabled" and not thr.get_rules())
-viz.banner(res["passed"], "restore", f"mode={thr.get_mode()}, rules={len(thr.get_rules())}")
-spark.stop()'''),
- notes("Backup: reports/throttle_backup.json — written by scripts/prep_obs.py."),
-], "02_s3_throttler.ipynb")
+live = {"mode": thr.get_mode(), "response_code": thr.get_response_code(),
+        "rules": sorted(r.get("id") for r in thr.get_rules())}
+res = results.write("TC2.8", "restore pre-demo throttler state", live == want,
+                    {"live": live, "backup": want})
+viz.banner(res["status"], "TC2.8 restore",
+           f"mode={live['mode']}, response_code={live['response_code']}, "
+           f"rules={live['rules'] or 'none'}")
+spark.stop()
+'''),
+ notes("Backup: reports/throttle_backup.json — written once by "
+       "scripts/prep_obs.py from a clean pre-demo state. The restore is "
+       "also registered at kernel exit."),
+    ])
 
-# ---------------- 03_s3_tables ----------------
-nb([
+
+# --------------------------------------------------- 03_s3_tables_iceberg
+def nb_03():
+    return notebook([
  md("# 03 — S3 Tables (Apache Iceberg)\n"
-    "**Objective:** native Iceberg tables on ObjectScale via Spark's REST catalog — "
-    "no data movement.\n\n"
-    "**Customer sees:** table bucket + namespace, DDL/DML, MERGE, schema evolution, "
-    "time travel, and a read-only denial.\n**TC:** TC3.1–TC3.7"),
- md("## Step 1 — Session\nSparkSession with the `os` REST catalog pointed at the OBS "
-    "TableHead endpoint (SigV4, table bucket ARN prefix)."),
- py(BOOT),
- notes("Catalog os -> http://192.168.1.31:19020/iceberg, warehouse=poc-lakehouse ARN."),
+    "**Objective:** native Iceberg tables on ObjectScale via Spark's REST "
+    "catalog — no data movement.\n\n"
+    "**Customer sees:** table bucket + namespace, DDL/DML, MERGE, schema "
+    "evolution, time travel, and a read-only denial.\n**TC:** TC3.1–TC3.7"),
+ md("## Step 1 — Session\nSparkSession with the `os` REST catalog pointed "
+    "at the ObjectScale TableHead endpoint (SigV4, table bucket ARN as "
+    "prefix). The catalog identity is passed explicitly per session."),
+ py('''
+import pandas as pd
+from poc import config, results, s3util, viz
+import poc.spark_helpers as sh
+
+spark = sh.build_session("obs-poc", tables_user="tables-rw")
+viz.table(pd.DataFrame(sh.versions(spark).items(), columns=["component", "version"]))
+print("run id:", results.run_id(), "| session identities:", sh.identities(spark))
+print("catalog os ->", config.ICEBERG_REST_URI, "| warehouse", config.ICEBERG_WAREHOUSE)
+T = f"os.{config.TABLES_NAMESPACE}.orders_ice"
+'''),
+ notes("Catalog `os`: Iceberg REST on the TableHead endpoint (HTTPS 19021), "
+       "warehouse = the poc-lakehouse table bucket ARN."),
  md("## Step 2 — Table bucket & namespace via S3 Tables API (TC3.1)\n"
-    "Create/confirm the table bucket and namespace through the AWS-compatible API and "
-    "show the responses."),
- py('''st = s3util.s3tables("tables-rw")
-arn = f"arn:aws:s3tables:::bucket/{config.OBS_TABLE_BUCKET}"
-ns = config.TABLES_NAMESPACE
+    "Confirm the table bucket and namespace through the AWS-compatible API "
+    "and show the responses."),
+ py('''
+st = s3util.s3tables("tables-rw")
+arn = config.table_bucket_arn()
 tbl = st.list_table_buckets()["tableBuckets"]
-namespaces = [n for n in st.list_namespaces(tableBucketARN=arn).get("namespaces",[])]
-viz.table(pd.DataFrame(tbl)); viz.table(pd.DataFrame(namespaces, columns=["namespace"]))
-res = results.write("TC3.1", "bucket+namespace", bool(tbl) and bool(namespaces))
-viz.banner(res["passed"], "TC3.1", f"bucket={config.OBS_TABLE_BUCKET} ns={ns}")'''),
+namespaces = st.list_namespaces(tableBucketARN=arn).get("namespaces", [])
+viz.table(pd.DataFrame(tbl)); viz.table(pd.DataFrame(namespaces)[["namespace"]])
+has_bucket = any(b.get("name") == config.TABLE_BUCKET for b in tbl)
+has_ns = any(n["namespace"] == [config.TABLES_NAMESPACE] for n in namespaces)
+res = results.write("TC3.1", "bucket+namespace", has_bucket and has_ns,
+                    {"table_bucket": config.TABLE_BUCKET, "found": has_bucket,
+                     "namespace": config.TABLES_NAMESPACE, "ns_found": has_ns})
+viz.banner(res["status"], "TC3.1",
+           f"bucket={config.TABLE_BUCKET} ns={config.TABLES_NAMESPACE}")
+'''),
  notes("boto3 s3tables client + x-emc-namespace header."),
  md("## Step 3 — SHOW NAMESPACES + CREATE TABLE (TC3.2)\n"
-    "The same objects are now visible through Spark's Iceberg catalog — one control "
-    "plane, no ETL."),
- py('''spark.sql("SHOW NAMESPACES IN os").show()
-spark.sql(f"DROP TABLE IF EXISTS os.{config.TABLES_NAMESPACE}.orders_ice")
-spark.sql(f"""CREATE TABLE os.{config.TABLES_NAMESPACE}.orders_ice
+    "The same objects are visible through Spark's Iceberg catalog — one "
+    "control plane, no ETL."),
+ py('''
+spark.sql("SHOW NAMESPACES IN os").show()
+spark.sql(f"DROP TABLE IF EXISTS {T}")
+spark.sql(f"""CREATE TABLE {T}
  (order_id string, customer string, status string, amount double, qty int)
  USING iceberg""")
-res = results.write("TC3.2", "create table", True)
-viz.banner(res["passed"], "TC3.2", "os.pocns.orders_ice created")'''),
+created = "orders_ice" in [r["tableName"] for r in
+                           spark.sql(f"SHOW TABLES IN os.{config.TABLES_NAMESPACE}").collect()]
+res = results.write("TC3.2", "create table", created, {"table": T})
+viz.banner(res["status"], "TC3.2", f"{T} created")
+'''),
  notes("SparkCatalog 'os' — type=rest, SigV4-signed."),
  md("## Step 4 — INSERT + SELECT (TC3.3)\n"
-    "Insert rows through the Iceberg catalog; they land in the managed `--table-s3` "
-    "bucket on ObjectScale."),
- py('''spark.sql(f"""INSERT INTO os.{config.TABLES_NAMESPACE}.orders_ice
+    "Insert rows through the Iceberg catalog; they land in the managed "
+    "`--table-s3` bucket on ObjectScale."),
+ py('''
+spark.sql(f"""INSERT INTO {T}
  VALUES ('o1','cust-001','PAID',199.0,2),('o2','cust-002','NEW',49.5,1),
         ('o3','cust-003','SHIPPED',1200.0,10)""")
-rows = spark.sql(f"SELECT * FROM os.{config.TABLES_NAMESPACE}.orders_ice").toPandas()
+rows = spark.sql(f"SELECT * FROM {T} ORDER BY order_id").toPandas()
 viz.table(rows)
 res = results.write("TC3.3", "insert+select", len(rows) == 3, {"rows": len(rows)})
-viz.banner(res["passed"], "TC3.3")'''),
- notes("Data files visible in OBS UI under <uuid>--table-s3."),
+viz.banner(res["status"], "TC3.3", f"{len(rows)} rows")
+'''),
+ notes("Data files are visible in the OBS UI under <table-uuid>--table-s3."),
  md("## Step 5 — MERGE INTO (TC3.4)\n"
-    "Upsert a changed row — Iceberg's row-level update over object storage, before "
-    "and after side by side."),
- py('''before = rows.copy()
-spark.sql(f"""MERGE INTO os.{config.TABLES_NAMESPACE}.orders_ice t
+    "Upsert a changed row — Iceberg's row-level update over object "
+    "storage, before and after side by side."),
+ py('''
+before = rows.copy()
+spark.sql(f"""MERGE INTO {T} t
  USING (SELECT 'o2' order_id,'cust-002' customer,'PAID' status,55.0 amount,1 qty) u
  ON t.order_id=u.order_id WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *""")
-after = spark.sql(f"SELECT * FROM os.{config.TABLES_NAMESPACE}.orders_ice ORDER BY order_id").toPandas()
+after = spark.sql(f"SELECT * FROM {T} ORDER BY order_id").toPandas()
 viz.table(before.assign(state="before")); viz.table(after.assign(state="after"))
-res = results.write("TC3.4", "merge", after.loc[after.order_id=="o2","status"].iloc[0]=="PAID")
-viz.banner(res["passed"], "TC3.4", "o2 NEW -> PAID")'''),
+merged = (len(after) == 3
+          and after.loc[after.order_id == "o2", "status"].iloc[0] == "PAID")
+res = results.write("TC3.4", "merge", merged, {"rows_after": len(after)})
+viz.banner(res["status"], "TC3.4", "o2 NEW -> PAID")
+'''),
  notes("MERGE INTO needs the Iceberg SQL extensions — already configured."),
  md("## Step 6 — Schema evolution (TC3.5)\n"
     "Add a column without rewriting data."),
- py('''spark.sql(f"ALTER TABLE os.{config.TABLES_NAMESPACE}.orders_ice ADD COLUMNS (region string)")
-cols = spark.sql(f"DESCRIBE os.{config.TABLES_NAMESPACE}.orders_ice").toPandas()
+ py('''
+spark.sql(f"ALTER TABLE {T} ADD COLUMNS (region string)")
+cols = spark.sql(f"DESCRIBE {T}").toPandas()
 viz.table(cols)
 res = results.write("TC3.5", "add column", "region" in set(cols.col_name))
-viz.banner(res["passed"], "TC3.5")'''),
+viz.banner(res["status"], "TC3.5", "column region added")
+'''),
  notes("Metadata-only operation — instant."),
  md("## Step 7 — Time travel & snapshot history (TC3.6)\n"
-    "Query an earlier snapshot vs current, and show the snapshot log."),
- py('''snaps = spark.sql(f"SELECT snapshot_id, committed_at FROM os.{config.TABLES_NAMESPACE}.orders_ice.snapshots").toPandas()
-old = spark.sql(f"SELECT count(*) n FROM os.{config.TABLES_NAMESPACE}.orders_ice VERSION AS OF {snaps.snapshot_id.iloc[0]}").toPandas()
-cur = spark.sql(f"SELECT count(*) n FROM os.{config.TABLES_NAMESPACE}.orders_ice").toPandas()
-viz.table(snaps); viz.table(pd.concat([old.assign(view="first snapshot"), cur.assign(view="current")]))
-ok = len(snaps) >= 2 and int(old.n.iloc[0]) <= int(cur.n.iloc[0])
-res = results.write("TC3.6", "time travel", ok,
-                    {"snapshots": len(snaps), "first": int(old.n.iloc[0]),
-                     "current": int(cur.n.iloc[0])})
-viz.banner(res["passed"], "TC3.6", f"{len(snaps)} snapshots")'''),
- notes("VERSION AS OF uses snapshot_id; TIMESTAMP AS OF also supported."),
+    "Query the first snapshot vs the current state, and show the snapshot "
+    "log."),
+ py('''
+snaps = spark.sql(f"SELECT snapshot_id, committed_at FROM {T}.snapshots ORDER BY committed_at").toPandas()
+old = spark.sql(f"SELECT status FROM {T} VERSION AS OF {snaps.snapshot_id.iloc[0]} WHERE order_id='o2'").toPandas()
+cur = spark.sql(f"SELECT status FROM {T} WHERE order_id='o2'").toPandas()
+viz.table(snaps)
+viz.table(pd.concat([old.assign(view="first snapshot"), cur.assign(view="current")]))
+travelled = (len(snaps) >= 2 and old.status.iloc[0] == "NEW"
+             and cur.status.iloc[0] == "PAID")
+res = results.write("TC3.6", "time travel", travelled,
+                    {"snapshots": len(snaps), "o2_first": old.status.iloc[0],
+                     "o2_current": cur.status.iloc[0]})
+viz.banner(res["status"], "TC3.6",
+           f"{len(snaps)} snapshots; o2 was {old.status.iloc[0]}, is {cur.status.iloc[0]}")
+'''),
+ notes("VERSION AS OF uses snapshot_id; TIMESTAMP AS OF is also supported."),
  md("## Step 8 — Read-only denial (TC3.7)\n"
-    "Rebuild the session as tables-ro and run INSERT — should fail with Access Denied."),
- py('''spark.stop()
+    "One full, valid INSERT is run twice. As **tables-rw** it must succeed "
+    "(positive control). Then the session is rebuilt with the "
+    "**tables-ro** identity: SELECT must still work and the *same* INSERT "
+    "must fail with an access denial. PASS only if the error really is a "
+    "permission error and no row was added."),
+ py('''
+INSERT = f"INSERT INTO {T} VALUES ('o9','cust-009','NEW',10.0,1,'EU')"
+count = lambda s: s.sql(f"SELECT count(*) FROM {T}").first()[0]
+
+n0 = count(spark)
+spark.sql(INSERT)                                  # positive control: tables-rw
+n1 = count(spark)
+control_ok = n1 == n0 + 1
+spark.stop()
+
 spark = sh.build_session("obs-poc-ro", tables_user="tables-ro")
+ident = sh.identities(spark)
 try:
-    spark.sql(f"INSERT INTO os.{config.TABLES_NAMESPACE}.orders_ice BY NAME SELECT 'x' AS order_id")
-    denied, code = False, "unexpected success"
+    ro_rows, ro_select_error = count(spark), None
 except Exception as e:
-    denied, code = "Denied" in str(e) or "403" in str(e), str(e)[:60]
-res = results.write("TC3.7", "ro denied", denied, {"error": code})
-viz.banner(res["passed"], "TC3.7", f"Access Denied as expected")'''),
- notes("tables-ro: S3TablesReadOnlyAccess + ECSS3ReadOnlyAccess."),
+    ro_rows, ro_select_error = None, str(e).splitlines()[0][:200]
+try:
+    spark.sql(INSERT)
+    inserted, denial, first_line = True, None, "INSERT succeeded"
+except Exception as e:
+    inserted, denial = False, sh.access_denied_reason(e)
+    first_line = str(e).strip().splitlines()[0][:200]
+n2 = count(spark) if ro_select_error is None else None
+
+if inserted or (n2 is not None and n2 != n1):
+    st37, why37 = "FAIL", f"the read-only identity was able to write ({n1} -> {n2} rows)"
+elif ident["tables"] != "tables-ro":
+    st37, why37 = "INCONCLUSIVE", f"session ran as {ident['tables']}, not tables-ro"
+elif not control_ok:
+    st37, why37 = "INCONCLUSIVE", "positive control failed: the INSERT did not succeed as tables-rw"
+elif ro_select_error:
+    st37, why37 = "INCONCLUSIVE", f"tables-ro could not even read: {ro_select_error}"
+elif not denial:
+    st37, why37 = "INCONCLUSIVE", f"INSERT failed, but not with an access denial: {first_line}"
+else:
+    st37, why37 = "PASS", f"tables-ro reads {ro_rows} rows; INSERT denied: {denial}"
+res = results.write("TC3.7", "read-only identity denied", status=st37, detail=why37,
+    metrics={"identity": ident["tables"], "identity_key": ident["tables_key"],
+             "rw_control_insert_ok": control_ok, "ro_select_rows": ro_rows,
+             "rows_before_ro_insert": n1, "rows_after_ro_insert": n2,
+             "ro_insert_error": denial or first_line})
+viz.table(pd.DataFrame([
+    {"identity": "tables-rw", "statement": "INSERT", "result": "OK" if control_ok else "FAILED"},
+    {"identity": ident["tables"], "statement": "SELECT count(*)",
+     "result": ro_rows if ro_select_error is None else ro_select_error},
+    {"identity": ident["tables"], "statement": "INSERT", "result": denial or first_line}]))
+viz.banner(st37, "TC3.7 read-only denial", why37)
+'''),
+ notes("tables-ro: S3TablesReadOnlyAccess + ECSS3ReadOnlyAccess. The "
+       "identity is switched through catalog properties "
+       "(rest.access-key-id / s3.access-key-id), not environment variables, "
+       "and build_session verifies the running session really has it."),
  md("## Step 9 — List tables via API\n"
-    "Back to the control plane: list tables in the namespace via S3 Tables API."),
- py('''tabs = st.list_tables(tableBucketARN=arn, namespace=config.TABLES_NAMESPACE)["tables"]
-viz.table(pd.DataFrame(tabs)[["name","type"]])
-viz.banner(True, "tables listed", f"{len(tabs)} table(s)")
-spark.stop()'''),
- notes("Same table list is visible in the OBS UI under S3 Tables."),
-], "03_s3_tables_iceberg.ipynb")
+    "Back to the control plane: list tables in the namespace via the S3 "
+    "Tables API."),
+ py('''
+tabs = st.list_tables(tableBucketARN=arn, namespace=config.TABLES_NAMESPACE)["tables"]
+viz.table(pd.DataFrame(tabs)[["name", "type"]])
+print(f"{len(tabs)} table(s) in {config.TABLES_NAMESPACE}")
+spark.stop()
+'''),
+ notes("The same table list is visible in the OBS UI under S3 Tables."),
+    ])
 
-# ---------------- 04_summary ----------------
-nb([
+
+# -------------------------------------------------------------- 04_summary
+def nb_04():
+    return notebook([
  md("# 04 — Summary & Scorecard\n"
-    "**Objective:** pull every TC result into an O1–O3 objective scorecard.\n\n"
-    "**Customer sees:** green/red objective status and key numbers."),
- md("## Step 1 — Session + results"),
- py('''from poc import config, results, viz
-import pandas as pd, poc.spark_helpers as sh'''),
- md("## Step 2 — Objective scorecard\n"
-    "O1 Spark↔S3, O2 Throttler, O3 S3 Tables — each mapped to its test cases."),
- py('''sc = pd.DataFrame(results.scorecard())
-def style(r): return ["background-color:#1e7d32;color:#fff" if r.status=="PASS"
-                      else "background-color:#b71c1c;color:#fff"]*len(r)
-display(sc.style.apply(style, axis=1))'''),
- notes("TC files: reports/raw/TC*.json"),
- md("## Step 3 — Key metrics\n"
-    "Headline numbers pulled from the raw results."),
- py('''allr = results.load_all()
-kv = []
-for tc in ("TC1.6","TC2.4","TC3.6"):
-    r = allr.get(tc)
-    if r: kv.append({"tc": tc, **{k: v for k, v in r["metrics"].items() if isinstance(v,(int,float,str))}})
-viz.table(pd.DataFrame(kv))'''),
- md("## Step 4 — Report link\n"
-    "`reports/PoC_Report.html` is generated by scripts/report.py."),
- py('''ok = all(r["status"] == "PASS" for r in results.scorecard())
-viz.banner(ok, "all objectives", "see reports/PoC_Report.html")'''),
-], "04_summary.ipynb")
+    "**Objective:** pull every test-case result of **this run** into an "
+    "O1–O3 objective scorecard.\n\n"
+    "**Customer sees:** four possible states per objective — "
+    "PASS (green), FAIL (red), INCONCLUSIVE (amber: the evidence does not "
+    "decide) and INCOMPLETE (grey: a test case of this run is missing)."),
+ md("## Step 1 — Results of the current run"),
+ py('''
+import pandas as pd
+from IPython.display import display
+from poc import results, viz
 
-# ---------------- 99_reset ----------------
-nb([
+RID = results.run_id()
+allr = results.load_run(RID)
+print("run id:", RID, "|", len(allr), "test-case results in this run")
+'''),
+ md("## Step 2 — Objective scorecard\n"
+    "O1 Spark↔S3, O2 Throttler, O3 S3 Tables — each mapped to its test "
+    "cases. Results from other runs are ignored (listed as stale)."),
+ py('''
+sc = pd.DataFrame(results.scorecard(RID))
+display(sc[["objective", "description", "status", "test_cases", "pass", "fail",
+            "inconclusive", "missing", "not_pass"]]
+        .style.apply(viz.status_style, axis=1))
+'''),
+ notes("Rule: any missing test case -> INCOMPLETE; else any FAIL -> FAIL; "
+       "else any INCONCLUSIVE -> INCONCLUSIVE; else PASS."),
+ md("## Step 3 — Test cases\n"
+    "Every test case of this run with its status and reason."),
+ py('''
+tcs = pd.DataFrame([{"tc": tc, "name": r["name"], "status": results.status_of(r),
+                     "detail": r.get("detail") or ""}
+                    for tc, r in sorted(allr.items(),
+                                        key=lambda kv: [float(x) for x in kv[0][2:].split(".")])])
+display(tcs.style.apply(viz.status_style, axis=1))
+'''),
+ md("## Step 4 — Key metrics\n"
+    "Headline numbers pulled from the raw results."),
+ py('''
+kv = []
+for tc in ("TC1.6", "TC2.4", "TC2.5", "TC2.6", "TC2.7", "TC3.7"):
+    r = allr.get(tc)
+    if r:
+        kv.append({"tc": tc, **{k: v for k, v in r["metrics"].items()
+                                if isinstance(v, (int, float, str))}})
+viz.table(pd.DataFrame(kv).set_index("tc").T.fillna(""))
+'''),
+ md("## Step 5 — Overall\n"
+    "`reports/PoC_Report.html` (scripts/report.py) carries the same "
+    "scorecard for the same run ID."),
+ py('''
+overall = results.overall(RID)
+viz.banner(overall, "all objectives",
+           f"run {RID} — see reports/PoC_Report.html")
+'''),
+    ])
+
+
+# ---------------------------------------------------------------- 99_reset
+def nb_99():
+    return notebook([
  md("# 99 — Reset (presenter only)\n"
-    "Removes all demo objects, tables and restores the throttler backup. Re-runnable."),
- md("## Step 1 — Environment"),
- py('''from poc import config, results, viz
+    "Removes what **this PoC** created (demo objects, PoC tables and their "
+    "data buckets), restores the throttler backup, re-seeds, and starts a "
+    "new run ID. Re-runnable."),
+ md("## Step 1 — Dry run: what would be deleted\n"
+    "Nothing is changed in this step. Review the list — buckets ending in "
+    "`--table-s3` that do not belong to a PoC table are listed as "
+    "*left alone* and are never deleted."),
+ py('''
+import pandas as pd
+from poc import results, viz
 from poc.reset import full_reset
-import pandas as pd'''),
+
+def show(r):
+    viz.table(pd.DataFrame([r["objects_removed"]], index=["demo-* objects"]))
+    viz.table(pd.DataFrame({"tables": r["tables_removed"] or ["(none)"]}))
+    viz.table(pd.DataFrame(
+        [{"data bucket": b, "state": s} for b, s in r["data_buckets_deleted"].items()]
+        + [{"data bucket": b, "state": "left alone (not a PoC table)"}
+           for b in r["unattributed_left_alone"]]
+        or [{"data bucket": "(none)", "state": ""}]))
+    for note in r["notes"]:
+        print("note:", note)
+
+print("previous run id:", results.run_id())
+plan = full_reset(dry_run=True)
+show(plan)
+print("throttler:", plan["restore_throttler"], "| table bucket:", plan["table_bucket_deleted"])
+'''),
  md("## Step 2 — Full reset\n"
-    "Deletes `<run_id>` objects in both buckets, drops all tables/namespaces **and "
-    "the table bucket itself** (plus orphan `--table-s3` data buckets), restores "
-    "`reports/throttle_backup.json`, then re-seeds bucket + namespace."),
- py('''out = full_reset()
-viz.table(pd.DataFrame([out["objects_removed"]]))
-viz.table(pd.DataFrame({"removed_tables": out["tables_removed"] or ["(none)"]}))
-viz.table(pd.DataFrame([{"table_bucket_deleted": out["table_bucket_deleted"],
-                        "data_buckets_deleted": len(out["data_buckets_deleted"])}]))
-viz.banner(True, "reset done", f"throttler -> {out['restore_throttler'] or 'baseline'}")'''),
-], "99_reset.ipynb")
-print("done")
+    "Restores `reports/throttle_backup.json`, deletes `demo-*` objects in "
+    "both buckets, drops the PoC tables/namespaces, their own data buckets "
+    "and the PoC table bucket, then re-seeds bucket + namespace and starts "
+    "a new run ID."),
+ py('''
+done = full_reset()
+show(done)
+problems = [f"{b}: {s}" for b, s in done["data_buckets_deleted"].items() if s.startswith("FAILED")]
+problems += [t for t in done["tables_removed"] if "FAILED" in t]
+pending = [b for b, s in done["data_buckets_deleted"].items() if s.startswith("pending")]
+RID = results.new_run()
+print("throttler restored:", done["restore_throttler"])
+print("seed:", done["seed"], "| new run id:", RID)
+viz.banner(not problems, "reset",
+           f"new run {RID}" + (f"; {len(pending)} data bucket(s) still being emptied "
+                               f"by ObjectScale — retried on the next reset" if pending else "")
+           + (f"; problems: {problems}" if problems else ""))
+'''),
+ notes("ObjectScale empties a dropped table's data bucket by itself and "
+       "refuses changes meanwhile (EmptyBucketInProgress) — such buckets "
+       "are reported as pending and remembered for the next reset."),
+    ])
+
+
+NOTEBOOKS = {
+    "00_smoke.ipynb": nb_00,
+    "01_spark_on_objectscale.ipynb": nb_01,
+    "02_s3_throttler.ipynb": nb_02,
+    "03_s3_tables_iceberg.ipynb": nb_03,
+    "04_summary.ipynb": nb_04,
+    "99_reset.ipynb": nb_99,
+}
+
+
+def generate(out_dir=None):
+    out_dir = pathlib.Path(out_dir or ROOT / "notebooks")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, build in NOTEBOOKS.items():
+        nbformat.write(build(), out_dir / name)
+        print("wrote", out_dir / name)
+    return out_dir
+
+
+if __name__ == "__main__":
+    generate(sys.argv[1] if len(sys.argv) > 1 else None)
+    print("done")
