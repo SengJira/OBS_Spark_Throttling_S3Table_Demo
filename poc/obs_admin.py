@@ -17,7 +17,7 @@ class _PinNoHostnameAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **kw):
         kw["assert_hostname"] = False
         kw["cert_reqs"] = "CERT_REQUIRED"
-        kw["ca_certs"] = "/etc/ssl/certs/ca-certificates.crt"
+        kw["ca_certs"] = config.CA_BUNDLE
         return super().init_poolmanager(connections, maxsize, block, **kw)
 
 
@@ -28,7 +28,7 @@ class MgmtApi:
         self._password = password or config.OBS_ROOT_PASSWORD
         self.s = requests.Session()
         self.s.mount("https://", _PinNoHostnameAdapter())
-        self.s.verify = "/etc/ssl/certs/ca-certificates.crt"
+        self.s.verify = config.CA_BUNDLE
         self._token = None
         self._lock = threading.Lock()
 

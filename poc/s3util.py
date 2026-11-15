@@ -29,7 +29,7 @@ def s3(user="admin", endpoint=None, timeout_s=(3, 10),
                           max_pool_connections=max_pool_connections,
                           retries={"max_attempts": max_attempts,
                                    "mode": "standard"}),
-        verify="/etc/ssl/certs/ca-certificates.crt",
+        verify=config.CA_BUNDLE,
     )
 
 
@@ -43,6 +43,7 @@ def s3tables(user="tables-rw"):
         region_name=config.OBS_REGION,
         config=BotoConfig(signature_version="v4",
                           retries={"max_attempts": 5}),
+        verify=config.CA_BUNDLE,
     )
     # OBS tablesvc resolves the caller's namespace from x-emc-namespace
     def _add_ns(**kw):

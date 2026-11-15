@@ -55,7 +55,12 @@ def get(key, default=None):
 OBS_HOST = get("OBS_HOST", "192.168.1.31")
 OBS_MGMT = get("OBS_MGMT", f"https://{OBS_HOST}:4443")
 OBS_S3_ENDPOINT = get("OBS_S3_ENDPOINT", f"https://{OBS_HOST}:9021")
-OBS_TABLES_ENDPOINT = get("OBS_TABLES_ENDPOINT", f"http://{OBS_HOST}:19020")
+# TableHead (S3 Tables + Iceberg REST): HTTPS on 19021 (verified live with the
+# OBS CA for both boto3 and the Spark/Iceberg REST client); 19020 is plain HTTP
+OBS_TABLES_ENDPOINT = get("OBS_TABLES_ENDPOINT", f"https://{OBS_HOST}:19021")
+# CA bundle that contains the ObjectScale CA (system bundle after
+# update-ca-certificates); TLS verification is always on
+CA_BUNDLE = get("OBS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
 OBS_REGION = get("OBS_REGION", "us-east-1")
 OBS_NAMESPACE = get("OBS_NAMESPACE", "poc")
 OBS_ROOT_PASSWORD = os.environ.get("OBS_ROOT_PASSWORD", "")  # never stored
