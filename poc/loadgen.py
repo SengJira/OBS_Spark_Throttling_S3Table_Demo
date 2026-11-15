@@ -16,6 +16,7 @@ This module never touches throttle configuration — rule changes belong to
 the approved lab workflow (notebook 02 / scripts/prep_obs.py backup+restore).
 """
 import threading, time, collections, statistics, itertools, contextlib
+import json, urllib.request, urllib.error
 from . import s3util, config, results
 
 MAX_KEYS = 20000           # cap noisy objects per run (0 = unlimited)
@@ -91,11 +92,13 @@ def pctile(lats, p):
 
 class LoadGen:
     def __init__(self, bucket=config.OBS_BUCKET_THROTTLE, chunk=CHUNK,
-                 max_keys=MAX_KEYS, timeout_s=(3, 10)):
+                 max_keys=MAX_KEYS, timeout_s=(3, 10), run_id=None):
         self.bucket = bucket
         self.chunk = chunk
         self.max_keys = max_keys
         self.timeout_s = timeout_s
+        self.run_id = run_id or results.run_id()
+        self.remote_noisy = None          # RemoteNoisy when NOISY_HOST is set
         self.events = collections.deque(maxlen=250000)   # live-chart buffer
         self.events_total = 0               # events ever recorded (chart cursor)
         self._totals = collections.Counter()
@@ -175,6 +178,47 @@ class LoadGen:
                          "throttled" if cls in THROTTLED else "errors"] += 1
             self._agg_buf[ev.phase][f"{tenant} {op}"].append(
                 (ts, latency_ms, status, code, retries))
+
+    def _phase_tag_for_ts(self, ts):
+        """Phase tag for a request that STARTED at wall time `ts`: closed
+        phases first, then the currently open phase. Remote noisy events are
+        ingested after the fact, so the tag must come from the timestamp —
+        not from whichever phase happens to be open when the HTTP response
+        arrives."""
+        with self._lock:
+            entries = list(self.phases)
+            if self._phase_tag is not None and self._phase_start is not None:
+                entries.append({"name": self._phase, "tag": self._phase_tag,
+                                "start": self._phase_start, "end": None})
+            cur = self._phase_tag or "init"
+        for ph in entries:
+            end = ph.get("end")
+            if ts >= ph["start"] and (end is None or ts < end):
+                return ph["tag"]
+        return cur if ts >= (entries[-1]["start"] if entries else 0) else "init"
+
+    def ingest_event(self, tenant, op, ts, latency_ms, status, code="",
+                     retries=0):
+        """Record one remotely generated request into the local metrics.
+
+        Used by RemoteNoisy: the remote agent owns the S3 call, U01 owns the
+        phase timeline and the verdicts. `ts` is the remote request-start
+        wall time; phase attribution is by timestamp so late-arriving events
+        still land in the phase they belonged to."""
+        tag = self._phase_tag_for_ts(ts)
+        ev = Event(ts, tenant, op, latency_ms, status, code, retries, tag)
+        with self._lock:
+            self.events.append(ev)
+            self.events_total += 1
+            cls = classify(status, code)
+            self._totals["ok" if cls == "ok" else
+                         "throttled" if cls in THROTTLED else "errors"] += 1
+            self._agg_buf[tag][f"{tenant} {op}"].append(
+                (ts, latency_ms, status, code, retries))
+
+    def attach_remote(self, remote):
+        """Delegate noisy-tenant control/events to a RemoteNoisy client."""
+        self.remote_noisy = remote
 
     def _events(self):
         with self._lock:
@@ -325,7 +369,7 @@ class LoadGen:
 
     def _noisy_put(self, worker_id):
         cli = s3util.s3("noisy", timeout_s=self.timeout_s, max_attempts=1)
-        rid = results.run_id()
+        rid = self.run_id
         while not self._stopped("tenant-noisy"):
             if self._paused("tenant-noisy"):
                 time.sleep(0.25); continue
@@ -370,16 +414,26 @@ class LoadGen:
 
     # ---------- control ----------
     def running(self, tenant=None):
+        if tenant == "tenant-noisy" and self.remote_noisy is not None:
+            return self.remote_noisy.running("tenant-noisy")
         if tenant:
             return any(t.is_alive() for t in self.threads[tenant])
-        return any(t.is_alive() for ts in self.threads.values() for t in ts)
+        local = any(t.is_alive() for ts in self.threads.values() for t in ts)
+        if self.remote_noisy is not None:
+            return local or self.remote_noisy.running("tenant-noisy")
+        return local
 
     def lingering(self, tenant=None):
         """Workers still alive — should be 0 after a successful stop."""
+        if tenant == "tenant-noisy" and self.remote_noisy is not None:
+            return self.remote_noisy.lingering("tenant-noisy")
         if tenant:
             return sum(1 for t in self.threads[tenant] if t.is_alive())
-        return sum(1 for ts in self.threads.values()
-                   for t in ts if t.is_alive())
+        local = sum(1 for ts in self.threads.values()
+                    for t in ts if t.is_alive())
+        if self.remote_noisy is not None:
+            return local + self.remote_noisy.lingering("tenant-noisy")
+        return local
 
     def start(self, seed_key=None, noisy=True, critical=True,
               noisy_threads=6, critical_threads=2, critical_interval=0):
@@ -388,7 +442,7 @@ class LoadGen:
         if self.running():
             return self.seed_key
         if seed_key is None:
-            seed_key = f"{results.run_id()}/critical-seed.bin"
+            seed_key = f"{self.run_id}/critical-seed.bin"
             s3util.s3("critical").put_object(
                 Bucket=self.bucket, Key=seed_key, Body=self._payload)
         self.seed_key = seed_key
@@ -403,6 +457,8 @@ class LoadGen:
 
     def add_noisy(self, threads=6):
         """Launch noisy PUT workers; no-op if any are already alive."""
+        if self.remote_noisy is not None:
+            return self.remote_noisy.add_noisy(threads)
         if self.running("tenant-noisy"):
             return 0
         self._tenant_stop["tenant-noisy"].clear()
@@ -431,6 +487,8 @@ class LoadGen:
     def stop_tenant(self, tenant):
         """Stop one tenant's workers; returns the count still alive after
         join timeout (kept in threads[] so callers can retry/observe)."""
+        if tenant == "tenant-noisy" and self.remote_noisy is not None:
+            return self.remote_noisy.stop_noisy()
         self._tenant_stop[tenant].set()
         self._tenant_pause[tenant].clear()   # paused workers must see stop
         still = []
@@ -457,8 +515,16 @@ class LoadGen:
         for e in self._tenant_pause.values():
             e.clear()
 
-    def pause_noisy(self):      self._tenant_pause["tenant-noisy"].set()
-    def resume_noisy(self):     self._tenant_pause["tenant-noisy"].clear()
+    def pause_noisy(self):
+        if self.remote_noisy is not None:
+            self.remote_noisy.pause_noisy(); return
+        self._tenant_pause["tenant-noisy"].set()
+
+    def resume_noisy(self):
+        if self.remote_noisy is not None:
+            self.remote_noisy.resume_noisy(); return
+        self._tenant_pause["tenant-noisy"].clear()
+
     def pause_critical(self):   self._tenant_pause["tenant-critical"].set()
     def resume_critical(self):  self._tenant_pause["tenant-critical"].clear()
 
@@ -469,27 +535,47 @@ class LoadGen:
         for e in self._tenant_pause.values():
             e.clear()
         self.end_phase()
-        return (self.stop_tenant("tenant-noisy")
-                + self.stop_tenant("tenant-critical"))
+        leftover = (self.stop_tenant("tenant-noisy")
+                    + self.stop_tenant("tenant-critical"))
+        if self.remote_noisy is not None:
+            self.remote_noisy.close()
+        return leftover
 
     # ---------- tenant isolation ----------
+    _TENANT_LABEL = {"noisy": "tenant-noisy", "critical": "tenant-critical"}
+
+    def verify_tenant(self, user, label=None):
+        """Prove one PoC principal can write+read an object in the shared
+        namespace bucket. Returns the display row."""
+        label = label or self._TENANT_LABEL.get(user, user)
+        ak, _ = config.USERS[user]
+        cli = s3util.s3(user)
+        key = f"{self.run_id}/probe/{user}.bin"
+        cli.put_object(Bucket=self.bucket, Key=key, Body=b"probe")
+        cli.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+        return {"tenant": label, "access_key": ak[:4] + "…",
+                "own_object_rw": "OK"}
+
     def verify_tenants(self):
         """Prove noisy/critical are distinct IAM principals that each get
         working S3 access in the shared namespace bucket."""
-        rid = results.run_id()
-        rows = []
-        for label, user in (("tenant-noisy", "noisy"),
-                            ("tenant-critical", "critical")):
-            ak, _ = config.USERS[user]
-            cli = s3util.s3(user)
-            key = f"{rid}/probe/{user}.bin"
-            cli.put_object(Bucket=self.bucket, Key=key, Body=b"probe")
-            cli.get_object(Bucket=self.bucket, Key=key)["Body"].read()
-            rows.append({"tenant": label, "access_key": ak[:4] + "…",
-                         "own_object_rw": "OK"})
+        rows = [self.verify_tenant("noisy", "tenant-noisy"),
+                self.verify_tenant("critical", "tenant-critical")]
         distinct = len({config.USERS["noisy"][0],
                         config.USERS["critical"][0]}) == 2
         return rows, distinct
+
+    def noisy_burst(self, bucket, prefix, seconds=20, threads=4, size=1024,
+                    keys_per_thread=50):
+        """Short tenant-noisy PUT burst under one key prefix — local or on
+        the remote noisy host when NOISY_HOST is configured."""
+        if self.remote_noisy is not None:
+            return self.remote_noisy.burst(bucket, prefix, seconds=seconds,
+                                           threads=threads, size=size,
+                                           keys_per_thread=keys_per_thread)
+        return put_burst("noisy", bucket, prefix, seconds=seconds,
+                         threads=threads, size=size,
+                         keys_per_thread=keys_per_thread)
 
 
 def put_burst(user, bucket, prefix, seconds=20, threads=4, size=1024,
@@ -534,3 +620,161 @@ def put_burst(user, bucket, prefix, seconds=20, threads=4, size=1024,
     agg.update(seconds=round(span, 1), ok_tps=agg["ok"] / max(1e-9, span),
                prefix=prefix, user=user)
     return agg
+
+
+class RemoteNoisyError(RuntimeError):
+    pass
+
+
+class RemoteNoisy:
+    """U01-side client for poc/noisy_agent.py on the noisy PUT host.
+
+    The notebook keeps using LoadGen for phases, critical GETs, verdicts and
+    the chart; only tenant-noisy control and event ingestion are delegated
+    here. Events are pulled continuously and re-ingested into the local
+    LoadGen by request-start timestamp, so phase_stats()/evaluate() need no
+    remote-specific logic."""
+
+    def __init__(self, lg, base_url, token="", bucket=config.OBS_BUCKET_THROTTLE,
+                 run_id=None, threads=6, max_keys=MAX_KEYS, chunk=CHUNK,
+                 timeout_s=(3, 10), poll_s=1.0):
+        self.lg = lg
+        self.base_url = base_url if "://" in base_url else f"http://{base_url}"
+        self.token = token
+        self.bucket = bucket
+        self.run_id = run_id or lg.run_id
+        self.threads = threads
+        self.max_keys = max_keys
+        self.chunk = chunk
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+        self.cursor = 0
+        self.ingested = 0
+        self.last_error = None
+        self._stop = threading.Event()
+        lg.attach_remote(self)
+        self._poller = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poller.start()
+
+    # ---------- HTTP ----------
+    def _headers(self):
+        return {"X-POC-Token": self.token,
+                "X-POC-Time": f"{time.time():.6f}",
+                "Content-Type": "application/json"}
+
+    def _request(self, method, path, body=None, timeout=10):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base_url + path, data=data,
+                                     headers=self._headers(), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read()[:300]
+            raise RemoteNoisyError(f"{method} {path} -> HTTP {e.code}: {detail!r}")
+        except Exception as e:
+            raise RemoteNoisyError(f"{method} {path} failed: {e}")
+
+    def health(self, timeout=10):
+        return self._request("GET", "/health", timeout=timeout)
+
+    def check_clock(self, limit_ms=50.0, timeout=10):
+        """Return (offset_ms, health) or raise when the U01/U02 clocks are
+        not synchronized closely enough for timestamp phase attribution."""
+        h = self.health(timeout=timeout)
+        off = h.get("offset_ms")
+        if off is None or abs(off) > limit_ms:
+            raise RemoteNoisyError(
+                f"U01/U02 clock offset {off} ms exceeds {limit_ms:.0f} ms — "
+                "sync chrony on both hosts before running notebook 02")
+        return off, h
+
+    def status(self, timeout=5):
+        return self._request("GET", "/status", timeout=timeout)
+
+    # ---------- preflight / tenant proof ----------
+    def preflight(self, run_id=None):
+        return self._request("POST", "/preflight",
+                             {"run_id": run_id or self.run_id}, timeout=30)
+
+    def verify_tenants(self):
+        """Noisy proof comes from the remote agent; critical proof stays local."""
+        pf = self.preflight()
+        row = pf.get("row") or {"tenant": "tenant-noisy", "access_key": "…",
+                                "own_object_rw": "FAIL",
+                                "error": pf.get("error", "no row")}
+        crit = self.lg.verify_tenant("critical", "tenant-critical")
+        distinct = len({config.USERS["noisy"][0],
+                        config.USERS["critical"][0]}) == 2
+        ok = bool(pf.get("ok")) and row.get("own_object_rw") == "OK" \
+            and crit.get("own_object_rw") == "OK" and distinct
+        return [row, crit], ok
+
+    # ---------- noisy controls (same shape as LoadGen) ----------
+    def add_noisy(self, threads=6):
+        res = self._request("POST", "/noisy/start", {
+            "threads": int(threads), "run_id": self.run_id,
+            "bucket": self.bucket, "max_keys": self.max_keys,
+            "chunk": self.chunk, "timeout_s": list(self.timeout_s)}, timeout=15)
+        return int(res.get("launched", 0))
+
+    def pause_noisy(self):
+        self._request("POST", "/noisy/pause", {}, timeout=10)
+
+    def resume_noisy(self):
+        self._request("POST", "/noisy/resume", {}, timeout=10)
+
+    def stop_noisy(self):
+        res = self._request("POST", "/noisy/stop", {}, timeout=30)
+        return int(res.get("lingering", 0))
+
+    def burst(self, bucket, prefix, seconds=20, threads=4, size=1024,
+              keys_per_thread=50):
+        return self._request("POST", "/burst", {
+            "bucket": bucket, "prefix": prefix, "seconds": seconds,
+            "threads": threads, "size": size,
+            "keys_per_thread": keys_per_thread}, timeout=float(seconds) + 30)
+
+    def running(self, tenant="tenant-noisy"):
+        if tenant == "tenant-critical":
+            return self.lg.running("tenant-critical")
+        if tenant not in (None, "tenant-noisy"):
+            return False
+        return bool(self.status().get("noisy", {}).get("running"))
+
+    def lingering(self, tenant="tenant-noisy"):
+        if tenant == "tenant-critical":
+            return self.lg.lingering("tenant-critical")
+        if tenant not in (None, "tenant-noisy"):
+            return 0
+        return int(self.status().get("noisy", {}).get("lingering", 0))
+
+    # ---------- event pull ----------
+    def poll(self):
+        res = self._request("GET", f"/events?since={self.cursor}", timeout=15)
+        n = 0
+        for ev in res.get("events", []):
+            if ev.get("tenant") != "tenant-noisy" or ev.get("op") != "PUT":
+                continue
+            self.lg.ingest_event("tenant-noisy", "PUT", ev["ts"],
+                                 ev.get("lat_ms", 0), ev.get("status", 599),
+                                 ev.get("code", ""), ev.get("retries", 0))
+            n += 1
+        self.cursor = int(res.get("cursor", self.cursor))
+        self.ingested += n
+        self.last_error = None
+        return n
+
+    def _poll_loop(self):
+        while not self._stop.is_set():
+            try:
+                self.poll()
+                self._stop.wait(self.poll_s)
+            except Exception as e:
+                self.last_error = str(e)
+                self._stop.wait(min(10.0, self.poll_s * 5))
+
+    def close(self):
+        self._stop.set()
+        self._poller.join(timeout=2)

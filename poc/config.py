@@ -93,6 +93,15 @@ TABLES_NAMESPACE = get("TABLES_NAMESPACE", "pocns")
 OBS_BUCKET = BUCKET_DATA
 OBS_BUCKET_THROTTLE = BUCKET_THROTTLE
 
+# Optional second load-generator host for the noisy tenant. Empty means the
+# noisy PUT workers run inside the Jupyter host's LoadGen (local mode).
+NOISY_HOST = get("NOISY_HOST", "")
+NOISY_AGENT_TOKEN = get("NOISY_AGENT_TOKEN", "")
+# noisy-agent.service on the remote host (poc/noisy_agent.py)
+NOISY_AGENT_BIND = get("NOISY_AGENT_BIND", "0.0.0.0")
+NOISY_AGENT_PORT = int(get("NOISY_AGENT_PORT", "8765") or 8765)
+NOISY_AGENT_IDLE_S = float(get("NOISY_AGENT_IDLE_S", "60") or 60)
+
 USERS = {
     "admin":  (get("POC_ADMIN_AK"),  get("POC_ADMIN_SK")),
     "noisy":  (get("NOISY_AK"),      get("NOISY_SK")),

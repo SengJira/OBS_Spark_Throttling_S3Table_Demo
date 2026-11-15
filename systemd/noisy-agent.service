@@ -1,0 +1,26 @@
+[Unit]
+Description=ObjectScale PoC noisy PUT agent (U02)
+After=network-online.target chrony.service
+Wants=network-online.target
+
+# Runs on the second client host only. It holds ONLY the tenant-noisy keys —
+# no admin/root/critical/table credentials. One-time host preparation:
+# README.md, "Remote noisy agent (U02)".
+[Service]
+Type=simple
+User=poc
+Group=poc
+WorkingDirectory=/opt/obs-poc
+Environment=POC_ROOT=/opt/obs-poc
+Environment=POC_SECRETS_DIR=/var/lib/obs-poc/secrets
+EnvironmentFile=-/etc/obs-poc/noisy-agent.env
+ExecStart=/usr/bin/python3 -m poc.noisy_agent
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
