@@ -162,10 +162,12 @@ def test_remote_events_attribute_to_request_start_phase():
 
 def test_check_clock_rejects_large_offset():
     remote = loadgen.RemoteNoisy.__new__(loadgen.RemoteNoisy)
-    remote.health = lambda timeout=10: {"offset_ms": 120.0}
+    remote.measure_clock = lambda timeout=10: {"offset_ms": 120.0,
+                                               "rtt_ms": 1.0, "health": {}}
     with pytest.raises(loadgen.RemoteNoisyError):
         remote.check_clock()
-    remote.health = lambda timeout=10: {"offset_ms": -20.0}
+    remote.measure_clock = lambda timeout=10: {"offset_ms": -20.0,
+                                               "rtt_ms": 1.0, "health": {}}
     off, _ = remote.check_clock()
     assert off == -20.0
 
@@ -188,3 +190,35 @@ def test_agent_reuses_generator_and_requires_run_id(agent):
     while state.lg.running("tenant-noisy") and time.time() < deadline:
         time.sleep(0.05)
     assert not state.lg.running("tenant-noisy")
+
+
+def test_remote_settle_no_missing_events(agent, monkeypatch):
+    base, _ = agent
+
+    def slow_put(self, Bucket, Key, Body=b"", **kw):
+        time.sleep(0.05)
+        FakeS3.put_calls.append((self.user, Key))
+        FakeS3.store[(Bucket, Key)] = b"x"
+        return {"ResponseMetadata": {"HTTPStatusCode": 200,
+                                     "RetryAttempts": 0}}
+
+    monkeypatch.setattr(FakeS3, "put_object", slow_put)
+    lg = loadgen.LoadGen(bucket="b", max_keys=0, run_id="demo-test",
+                         timeout_s=(1, 2))
+    remote = loadgen.RemoteNoisy(lg, base, token="secret", run_id="demo-test",
+                                 poll_s=0.05)
+    try:
+        lg.start_phase("p")
+        remote.add_noisy(threads=3)
+        time.sleep(0.2)
+        end = time.time()
+        lg.settle(end, timeout_s=5)
+        n1 = sum(1 for e in lg.events
+                 if e.tenant == "tenant-noisy" and e.ts < end)
+        time.sleep(0.4)
+        n2 = sum(1 for e in lg.events
+                 if e.tenant == "tenant-noisy" and e.ts < end)
+        assert n1 == n2 and n1 > 0
+    finally:
+        remote.close()
+        lg.stop()

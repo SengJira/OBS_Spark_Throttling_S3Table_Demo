@@ -229,25 +229,29 @@ def nb_02():
     "**TC:** TC2.1–TC2.11\n\n"
     "**Flow:** rules are verified and stored first (throttler still "
     "disabled) so they have fully propagated before enforcement is "
-    "measured → Phase 1 baseline (critical only) → Phase 2 contention "
-    "(+noisy, throttler disabled) → Phase 3 simulation (dry-run) → "
-    "propagation wait → Phase 4 enforcement (HTTP 429) → Phase 5 recovery "
-    "observation (noisy **keeps running**) → prefix-scoped rule → Spark "
-    "write as the throttled tenant → restore.\n\n"
+    "measured → baseline (critical only, paced) → contention (+noisy, "
+    "throttler disabled) → simulation (dry-run) → propagation wait with the "
+    "noisy tenant paused → pre-baseline (critical alone) → reference "
+    "(noisy paced at the rule limit) → enforcement (HTTP 429) → recovery "
+    "→ optional enforced-24 queue probe → post-baseline (noisy stopped) → "
+    "prefix rule → Spark write as the throttled tenant → restore.\n\n"
     "> ObjectScale caches the rule set for up to "
     "`rules_config_cache_expiration_time` = 300 s (read-only). The notebook "
     "therefore waits `PROPAGATION_S` (default 300 s) after storing the "
-    "rules before it measures enforcement. A verdict the evidence cannot "
-    "decide is INCONCLUSIVE — never a pass.\n\n"
+    "rules, with the noisy tenant paused so no write backlog builds up "
+    "before enforcement. A verdict the evidence cannot decide is "
+    "INCONCLUSIVE — never a pass.\n\n"
     "**Noisy host:** `NOISY_HOST` empty = noisy PUTs run locally on this "
     "host; `NOISY_HOST=192.168.1.41:8765` delegates only tenant-noisy "
     "control/events to `poc/noisy_agent.py` while critical GETs, phases, "
     "verdicts and the chart stay here. Remote mode refuses to run if the "
-    "two host clocks differ by more than 50 ms."),
+    "two host clocks differ by more than 50 ms, and re-checks the offset at "
+    "every phase boundary."),
  md("## Step 1 — Session, tenant isolation, effective policy\n"
     "Prove noisy/critical are distinct IAM principals, then **read** the "
     "current throttler state. The pre-demo backup must exist before "
-    "anything is changed."),
+    "anything is changed. Any leftover load from an interrupted run is "
+    "stopped first."),
  py('''
 import atexit, json, os, time
 import ipywidgets as w
@@ -259,37 +263,49 @@ from poc.loadgen import LoadGen, RemoteNoisy
 from poc.obs_admin import MgmtApi, Throttler
 import poc.spark_helpers as sh
 
+_old = globals().get("_POC_LG")
+if _old is not None:
+    _old.stop()
 spark = sh.build_session("obs-poc")
 viz.table(pd.DataFrame(sh.versions(spark).items(), columns=["component", "version"]))
 
 PHASE_S = int(os.environ.get("THROTTLE_PHASE_S", "60"))
 PROPAGATION_S = int(os.environ.get("PROPAGATION_S", "300"))
 SETTLE_S = int(os.environ.get("THROTTLE_SETTLE_S", "120"))
+CRITICAL_RATE = float(config.CRITICAL_RATE or 0)
+QUEUE_TEST = bool(config.QUEUE_TEST)
 DUR = {"baseline": PHASE_S, "contention": PHASE_S, "simulation": PHASE_S,
-       "enforced": 2 * PHASE_S, "recovery": PHASE_S,
+       "pre-baseline": PHASE_S, "reference": PHASE_S, "enforced": 2 * PHASE_S,
+       "enforced-24": PHASE_S, "recovery": PHASE_S, "post-baseline": PHASE_S,
        "burst": max(15, PHASE_S // 3)}
 RID = results.run_id()
 
-lg = LoadGen(max_keys=20000)
+lg = LoadGen(max_keys=0)
 remote = None
 if config.NOISY_HOST:
     if not config.NOISY_AGENT_TOKEN:
         raise RuntimeError("NOISY_HOST is set but NOISY_AGENT_TOKEN is empty — "
                            "the remote agent requires the shared X-POC-Token header")
     remote = RemoteNoisy(lg, config.NOISY_HOST, token=config.NOISY_AGENT_TOKEN,
-                         run_id=RID, max_keys=20000)
+                         run_id=RID, max_keys=0)
     try:
         offset, h = remote.check_clock()
         s3ok = (h.get("s3") or {}).get("ok")
         if not s3ok:
             raise RuntimeError("noisy agent cannot reach ObjectScale S3 on 9021: "
                                f"{(h.get('s3') or {}).get('error')}")
+        if remote.running("tenant-noisy"):
+            remote.stop_noisy()          # leftover from an interrupted run
+        st = remote.status()
+        if (st.get("noisy") or {}).get("running"):
+            raise RuntimeError("remote noisy agent still reports running after stop")
         iso_rows, iso_ok = remote.verify_tenants()
     except Exception:
         remote.close()
         raise
 else:
     iso_rows, iso_ok = lg.verify_tenants()
+_POC_LG = lg
 viz.table(pd.DataFrame(iso_rows))
 thr = Throttler(MgmtApi())
 pol = te.effective_policy(thr)
@@ -303,7 +319,8 @@ if not config.BACKUP_FILE.exists():
 if pol["mode"] == "enabled":
     raise RuntimeError("the throttler is already enforcing — this demo must start "
                        "from mode disabled/dry-run (restore the pre-demo state first)")
-print("run id:", RID, "| phase seconds:", DUR, "| PROPAGATION_S:", PROPAGATION_S)
+print("run id:", RID, "| phase seconds:", DUR, "| PROPAGATION_S:", PROPAGATION_S,
+      "| CRITICAL_RATE:", CRITICAL_RATE, "| QUEUE_TEST:", QUEUE_TEST)
 if remote is not None:
     print("noisy mode: REMOTE", remote.base_url,
           f"| U01/U02 clock offset {offset:+.1f} ms | agent S3 ok={s3ok}")
@@ -311,12 +328,88 @@ else:
     print("noisy mode: LOCAL (NOISY_HOST is empty)")
 viz.banner(iso_ok, "tenant isolation",
            "distinct principals; effective policy read (unchanged)")
+
+out = w.Output(); display(out)
+chart = viz.LiveChart(lg)
+PHASE_AUX = {}
+
+def finish_phase(name):
+    """Close a measured phase, settle its tail events, re-check the remote
+    clock and record contact stats. Returns the aux dict."""
+    end = lg.end_phase()
+    aux = {"end": end, "start": None, "settle_error": None,
+           "clock_offset_ms": None, "clock_rtt_ms": None, "clock_error": None,
+           "remote": None, "contact_ok": None, "max_outage_s": None}
+    try:
+        lg.settle(end, timeout_s=30)
+    except Exception as e:
+        aux["settle_error"] = str(e)
+    win = lg.phase_window(name) or (None, end)
+    aux["start"] = win[0]
+    if remote is not None:
+        try:
+            m = remote.recheck_clock(timeout=10)
+            aux["clock_offset_ms"] = m.get("offset_ms")
+            aux["clock_rtt_ms"] = m.get("rtt_ms")
+        except Exception as e:
+            aux["clock_error"] = str(e)
+        try:
+            st = remote.stats()
+            aux["remote"] = {k: st.get(k) for k in
+                             ("events_pulled", "poll_errors", "max_gap_s",
+                              "contact_age_s", "last_error")}
+            aux["contact_ok"] = bool(st.get("contact_ok"))
+            if win[0]:
+                aux["max_outage_s"] = remote.max_outage_between(win[0], end)
+        except Exception as e:
+            aux["contact_ok"] = False
+            aux["contact_error"] = str(e)
+    PHASE_AUX[name] = aux
+    return aux
+
+def clock_ok(name):
+    a = PHASE_AUX.get(name, {})
+    if a.get("clock_error"):
+        return False
+    off = a.get("clock_offset_ms")
+    return off is None or abs(off) <= 50
+
+def contact_reason(name):
+    """None when the phase is clean, else the FAIL reason."""
+    if remote is None:
+        a = PHASE_AUX.get(name, {})
+        return ("settle failed: " + a["settle_error"]) if a.get("settle_error") else None
+    a = PHASE_AUX.get(name, {})
+    if a.get("settle_error"):
+        return "settle failed: " + a["settle_error"]
+    if a.get("contact_ok") is False:
+        err = ((a.get("remote") or {}).get("last_error")
+               or a.get("contact_error") or "poll failing")
+        return f"lost contact with noisy host ({err})"
+    if (a.get("max_outage_s") or 0) > 5:
+        return f"lost contact with noisy host ({a['max_outage_s']:.1f}s poll gap)"
+    if a.get("clock_error"):
+        return "clock check failed: " + a["clock_error"]
+    if not clock_ok(name):
+        return f"clock offset {a.get('clock_offset_ms')} ms exceeds 50 ms"
+    return None
+
+def aux_metrics(name):
+    a = PHASE_AUX.get(name, {})
+    return {"clock_offset_ms": a.get("clock_offset_ms"),
+            "clock_rtt_ms": a.get("clock_rtt_ms"),
+            "settle_error": a.get("settle_error"),
+            "remote_pull": a.get("remote"),
+            "max_outage_s": a.get("max_outage_s"),
+            "contact_ok": a.get("contact_ok")}
 '''),
  notes("Shared namespace bucket, separate principals — that is what "
        "principal-scoped rules discriminate on. LoadGen talks to S3 with "
-       "SDK retries OFF so every 429 is seen as it arrives. In remote mode "
-       "this cell also proves the agent reaches ObjectScale on 9021, writes "
-       "as tenant-noisy, and that U01/U02 clocks agree within 50 ms."),
+       "SDK retries OFF so every 429 is seen as it arrives. Critical GETs "
+       "are open-loop paced at CRITICAL_RATE; missed slots make a phase "
+       "INCONCLUSIVE. In remote mode this cell also proves the agent "
+       "reaches ObjectScale on 9021, writes as tenant-noisy, stops any "
+       "leftover noisy load, and that U01/U02 clocks agree within 50 ms."),
  md("## Step 2 — Lab rules: schema verification, then store (TC2.2)\n"
     "Two rules for the noisy tenant: all PUTs capped at 50 TPS, and a "
     "tighter 10 TPS cap on one key prefix (`<run_id>/raw/*`). `verify_rule` "
@@ -362,38 +455,49 @@ print(f"rules stored at {time.strftime('%H:%M:%S', time.localtime(PUSHED_AT))} "
        "give every object key its own counter. Existing non-demo rules are "
        "kept in the pushed set."),
  md("## Step 3 — Phase 1: baseline (TC2.1)\n"
-    "Critical GETs alone — reference TPS and P50/P95/P99. Rules are stored "
-    "but the throttler is disabled."),
+    "Critical GETs alone at the paced CRITICAL_RATE — the reference TPS "
+    "and P50/P95/P99. Rules are stored but the throttler is disabled."),
  py('''
-out = w.Output(); display(out)
-lg.start(noisy=False, critical=True)
-lg.start_phase("baseline")
-chart = viz.LiveChart(lg); chart.mark("baseline")
+lg.start(noisy=False, critical=True, critical_threads=4,
+         critical_rate=CRITICAL_RATE)
+lg.start_phase("baseline"); chart.mark("baseline")
 chart.refresh(out, seconds=DUR["baseline"])
-bp = lg.phase_stats()["baseline"].get("tenant-critical GET", {})
-res = results.write("TC2.1", "baseline critical GETs",
-                    bp.get("ok", 0) >= 50 and bp.get("errors", 0) == 0,
-                    {k: round(bp.get(k, 0), 2) for k in ("n", "tps", "p50", "p95", "p99", "errors")})
-viz.banner(res["status"], "TC2.1 baseline",
-           f"{bp.get('tps', 0):.1f} TPS, p95 {bp.get('p95', 0):.0f} ms, "
-           f"p99 {bp.get('p99', 0):.0f} ms")
+aux = finish_phase("baseline")
+ps_all = lg.phase_stats()
+bp = ps_all["baseline"].get("tenant-critical GET", {})
+bad = contact_reason("baseline")
+st1 = "PASS" if (bp.get("ok", 0) >= 50 and bp.get("errors", 0) == 0
+                 and bad is None) else ("FAIL" if bad else "INCONCLUSIVE")
+res = results.write("TC2.1", "baseline critical GETs", status=st1,
+    detail=(bad or f"{bp.get('tps', 0):.1f} TPS, p95 {bp.get('p95', 0):.0f} ms, "
+                     f"p99 {bp.get('p99', 0):.0f} ms"),
+    metrics={k: round(bp.get(k, 0), 2) for k in
+             ("n", "tps", "p50", "p95", "p99", "errors", "throttled",
+              "tenant-critical GET_paced", "tenant-critical GET_missed")}
+            | {"critical_rate": CRITICAL_RATE, **aux_metrics("baseline")})
+viz.banner(st1, "TC2.1 baseline", res["detail"])
 '''),
  notes("Critical workload alone — the reference everything else is "
-       "compared with."),
+       "compared with. Latency is measured from the scheduled send time, so "
+       "client stalls are counted, not hidden."),
  md("## Step 4 — Phase 2: contention, throttler disabled (TC2.3)\n"
     "Noisy PUTs are added on top of the critical GETs. The throttler is "
     "still disabled, so this is the unprotected impact the rule must fix."),
  py('''
 lg.start_phase("contention"); chart.mark("contention"); lg.add_noisy(threads=6)
 chart.refresh(out, seconds=DUR["contention"])
+aux = finish_phase("contention")
 ps_all = lg.phase_stats()
 c = ps_all["contention"]
 bl = ps_all["baseline"].get("tenant-critical GET", {})
 ct, cn = c.get("tenant-critical GET", {}), c.get("tenant-noisy PUT", {})
+bad = contact_reason("contention")
 if min(ct.get("n", 0), cn.get("n", 0)) < 50:
     st3, why3 = "FAIL", "too few requests in the contention phase"
 elif cn.get("throttled", 0):
     st3, why3 = "FAIL", f"{cn['throttled']} throttle responses while the throttler is disabled"
+elif bad:
+    st3, why3 = "FAIL", bad
 else:
     st3, why3 = "PASS", (f"critical p95 {bl.get('p95', 0):.0f} -> {ct.get('p95', 0):.0f} ms "
                          f"with {cn.get('tps', 0):.0f} noisy PUT/s")
@@ -405,7 +509,9 @@ res = results.write("TC2.3", "contention (throttler disabled)", status=st3, deta
              "noisy_ok_tps": round(cn.get("ok", 0) / max(1e-9, c["_window"]["seconds"]), 1),
              "noisy_throttled": cn.get("throttled", 0), "mode": thr.get_mode(),
              "client_cpu_pct": {"baseline": ps_all["baseline"]["_window"]["client_cpu_pct"],
-                                "contention": c["_window"]["client_cpu_pct"]}})
+                                "contention": c["_window"]["client_cpu_pct"]},
+             "critical_missed_slots": c.get("tenant-critical GET_missed", 0),
+             **aux_metrics("contention")})
 viz.banner(st3, "TC2.3 contention", why3)
 '''),
  notes("Unrestricted noisy PUTs degrade critical latency — the problem "
@@ -425,13 +531,17 @@ viz.banner(st3, "TC2.3 contention", why3)
 thr.set_mode("dryrun")
 lg.start_phase("simulation"); chart.mark("simulation (dry-run)")
 chart.refresh(out, seconds=DUR["simulation"])
+aux = finish_phase("simulation")
 sp = lg.phase_stats()["simulation"]
 sn = sp.get("tenant-noisy PUT", {})
 srv_sim = te.server_counters(thr)
+bad = contact_reason("simulation")
 if sn.get("n", 0) < 50:
     st10, why10 = "INCONCLUSIVE", "too few noisy requests in the simulation phase"
 elif sn.get("throttled", 0):
     st10, why10 = "FAIL", f"{sn['throttled']} client throttle responses in dry-run"
+elif bad:
+    st10, why10 = "FAIL", bad
 else:
     st10, why10 = "PASS", (f"0 throttle responses in {sn['n']} noisy requests "
                            f"({sn.get('errors', 0)} other errors)")
@@ -440,38 +550,68 @@ res = results.write("TC2.10", "simulation mode (dry-run)", status=st10, detail=w
              "client_other_errors": sn.get("errors", 0),
              "noisy_ok_tps": round(sn.get("ok", 0) / max(1e-9, sp["_window"]["seconds"]), 1),
              "mode": thr.get_mode(),
-             "server_metrics_available": srv_sim["available"]})
+             "server_metrics_available": srv_sim["available"],
+             **aux_metrics("simulation")})
 viz.banner(st10, "TC2.10 simulation", why10)
 '''),
  notes("Dry-run validates rule matching safely. Simulated-match counters "
        "are a server-side concept: they are probed and reported as "
        "unavailable when the build does not expose them — never invented."),
- md("## Step 6 — Wait for rule propagation\n"
-    "ObjectScale caches the rule set for up to 300 s. Both workloads keep "
-    "running (still dry-run) until `PROPAGATION_S` has passed since the "
-    "rules were stored. This time is tagged as its own phase, "
-    "`propagation`, so it does not pollute the measured phases."),
+ md("## Step 6 — Propagation wait + pre-baseline\n"
+    "ObjectScale caches the rule set for up to 300 s. The noisy tenant is "
+    "**paused** (critical GETs continue) so no write backlog builds up "
+    "before enforcement. The last `PHASE_S` of the wait is measured as "
+    "`pre-baseline` — a fresh critical-alone reading taken as close to "
+    "enforcement as the cache allows."),
  py('''
+lg.pause_noisy()
 lg.start_phase("propagation"); chart.mark("propagation wait")
 countdown = w.HTML(); display(countdown)
-while (left := PROPAGATION_S - (time.time() - PUSHED_AT)) > 0:
+prop_end = PUSHED_AT + PROPAGATION_S - PHASE_S
+while (left := prop_end - time.time()) > 0:
     countdown.value = (f"<b>rule propagation: {left:.0f}s left</b> of {PROPAGATION_S}s "
-                       f"since the rules were stored (load keeps running, dry-run)")
+                       f"(noisy paused; critical still running, dry-run)")
     chart.refresh(out, seconds=min(10, left))
+aux_prop = finish_phase("propagation")
+
+lg.start_phase("pre-baseline"); chart.mark("pre-baseline (noisy paused)")
+chart.refresh(out, seconds=DUR["pre-baseline"])
+aux = finish_phase("pre-baseline")
 RULE_AGE_S = round(time.time() - PUSHED_AT, 1)
-countdown.value = f"<b>rules are {RULE_AGE_S:.0f}s old</b> — propagation wait complete"
+countdown.value = (f"<b>rules are {RULE_AGE_S:.0f}s old</b> — propagation wait "
+                   f"complete; pre-baseline p95 recorded</b>")
 print(f"rules stored {RULE_AGE_S:.0f}s ago (>= PROPAGATION_S={PROPAGATION_S}s) — "
       f"enforcement can now be measured")
 '''),
  notes("The countdown is live in JupyterLab; headless runs print the final "
-       "line. With the default 60 s phases roughly 120 s are spent here."),
- md("## Step 7 — Phase 4: enforcement, HTTP 429 (TC2.4)\n"
-    "Mode **enabled**, response code 429. The switch is read back, the "
-    "notebook waits until the new mode is visibly in effect (tagged "
-    "`switching`), then measures the `enforced` phase with both workloads "
-    "running. The status is computed: PASS needs an enforcement signature "
-    "**and** an accepted noisy rate within the limit."),
+       "line. Pausing the noisy tenant during the wait keeps the pre-"
+       "enforcement queue empty, so the reference and recovery phases "
+       "measure the throttler rather than a backlog."),
+ md("## Step 7 — Reference: noisy paced at the rule limit\n"
+    "The noisy tenant resumes at exactly `LIMIT` PUT/s (open-loop paced) "
+    "while the throttler is still in dry-run. This is the best result any "
+    "throttler could give: the critical workload sharing the system with "
+    "the maximum admissible noisy rate. Recovery is judged against it."),
  py('''
+lg.resume_noisy(); lg.set_noisy_rate(LIMIT)
+lg.start_phase("reference"); chart.mark("reference (noisy @ limit, dry-run)")
+chart.refresh(out, seconds=DUR["reference"])
+aux = finish_phase("reference")
+ps_all = lg.phase_stats()
+rf = ps_all["reference"].get("tenant-critical GET", {})
+rn = ps_all["reference"].get("tenant-noisy PUT", {})
+print(f"reference: critical p95 {rf.get('p95', 0):.1f} ms, noisy ok "
+      f"{rn.get('ok', 0) / max(1e-9, ps_all['reference']['_window']['seconds']):.1f} TPS")
+'''),
+ notes("No verdict is written for this phase — it is the comparison "
+       "baseline for recovery_vs_reference in TC2.9."),
+ md("## Step 8 — Phase 4: enforcement, HTTP 429 (TC2.4)\n"
+    "Mode **enabled**, response code 429, noisy back to as-fast-as-"
+    "possible 6 threads. The switch is read back, the notebook waits until "
+    "the new mode is visibly in effect (tagged `switching`), then measures "
+    "the `enforced` phase with both workloads running."),
+ py('''
+lg.set_noisy_rate(None)
 thr.set_response_code(429); thr.set_mode("enabled")
 time.sleep(2)                                   # let the config write settle
 eff = {"mode": thr.get_mode(), "response_code": thr.get_response_code(),
@@ -488,12 +628,16 @@ chart.refresh(out, seconds=half)
 sustained_mid = lg.sustained(10, LIMIT * 0.25)
 chart.refresh(out, seconds=DUR["enforced"] - half)
 sustained_end = lg.sustained(10, LIMIT * 0.25)
+aux = finish_phase("enforced")
 
 ps_all = lg.phase_stats()
 ep, cp = ps_all["enforced"], ps_all["contention"]
 en, ec = ep.get("tenant-noisy PUT", {}), ep.get("tenant-critical GET", {})
 st4, why4, enforced, enf_mode = te.tc24_status(
     ps_all, LIMIT, sustained=sustained_mid and sustained_end)
+bad = contact_reason("enforced")
+if bad:
+    st4, why4 = "FAIL", bad
 sig = te.signals(ps_all, LIMIT)
 res = results.write("TC2.4", "enforcement (HTTP 429)", status=st4, detail=why4,
     metrics={"noisy": {k: round(en.get(k, 0), 2) for k in
@@ -508,38 +652,90 @@ res = results.write("TC2.4", "enforcement (HTTP 429)", status=st4, detail=why4,
              "critical_p99": round(ec.get("p99", 0), 1),
              "critical_throttled": ec.get("throttled", 0),
              "critical_errors": ec.get("errors", 0),
+             "critical_missed_slots": ep.get("tenant-critical GET_missed", 0),
              "sustained_mid": sustained_mid, "sustained_end": sustained_end,
              "rule_age_at_enable_s": RULE_AGE_S, "seconds_to_effect": t_eff,
              "effective_config": eff,
-             "enforcement_active": enforced, "enforcement_mode": enf_mode})
+             "enforcement_active": enforced, "enforcement_mode": enf_mode,
+             **aux_metrics("enforced")})
 viz.banner(st4, "TC2.4 enforcement", why4)
 '''),
  notes("With client retries off ObjectScale shows both mechanisms: it "
        "queues requests to hold the accepted rate at the limit (latency "
        "tail grows) and rejects the overflow with 429 TooManyRequests. "
        "codes{} lists the S3 error codes exactly as received."),
- md("## Step 8 — Phase 5: continued recovery observation (TC2.5)\n"
-    "**No configuration change here** — enforcement from Step 7 stays "
-    "active and this phase simply keeps measuring. Noisy PUTs continue at "
-    "the same offered rate, the rule keeps capping them, and we observe "
-    "whether critical latency holds near baseline. Throttle responses on "
-    "the noisy side are expected to stay elevated."),
+ md("## Step 9 — Phase 5: recovery observation\n"
+    "**No configuration change here** — enforcement from Step 8 stays "
+    "active and the noisy tenant keeps offering as-fast-as-possible. This "
+    "phase measures critical latency while noisy is capped at the limit; "
+    "the verdict is written after post-baseline so the drift guard has "
+    "both critical-alone readings."),
  py('''
 lg.start_phase("recovery"); chart.mark("recovery (enforcement continues)")
 chart.refresh(out, seconds=DUR["recovery"])
+aux = finish_phase("recovery")
+print("recovery measured; verdict written after post-baseline")
+'''),
+ notes("The mechanism is the already-running enforcement, observed longer "
+       "— not a second action. The rule still admits ~50 noisy PUT/s by "
+       "design, so the critical workload shares the system with that "
+       "admitted load."),
+ md("## Step 10 — Optional queue-cost probe: enforced-24 (QUEUE_TEST=1)\n"
+    "Same as the enforced phase but with **24** noisy threads instead of 6. "
+    "If critical p95 gets clearly worse while accepted noisy TPS stays at "
+    "the limit, requests waiting in ObjectScale's throttle queue are "
+    "costing the other tenant — reported as a product finding."),
+ py('''
+if QUEUE_TEST:
+    lg.stop_noisy(); lg.add_noisy(threads=24)
+    lg.start_phase("enforced-24"); chart.mark("enforced-24 (queue probe)")
+    chart.refresh(out, seconds=DUR["enforced-24"])
+    aux24 = finish_phase("enforced-24")
+    ps24 = lg.phase_stats()["enforced-24"]
+    c24, n24 = ps24.get("tenant-critical GET", {}), ps24.get("tenant-noisy PUT", {})
+    print(f"enforced-24: critical p95 {c24.get('p95', 0):.1f} ms, noisy ok "
+          f"{n24.get('ok', 0) / max(1e-9, ps24['_window']['seconds']):.1f} TPS")
+else:
+    print("QUEUE_TEST=0 — skipping enforced-24")
+'''),
+ notes("Disabled by default. Enable with QUEUE_TEST=1 for the queue-cost "
+       "experiment."),
+ md("## Step 11 — Post-baseline + recovery verdict (TC2.5)\n"
+    "The noisy tenant is **stopped** while enforcement stays on: a second "
+    "critical-alone reading that detects environment drift. TC2.5 is "
+    "written here so `baseline_stable` and `recovery_vs_reference` have "
+    "every phase they need."),
+ py('''
+lg.stop_noisy()
+lg.start_phase("post-baseline"); chart.mark("post-baseline (noisy stopped)")
+chart.refresh(out, seconds=DUR["post-baseline"])
+aux = finish_phase("post-baseline")
 ps_all = lg.phase_stats()
-rp = ps_all["recovery"]
-rc, rn = rp.get("tenant-critical GET", {}), rp.get("tenant-noisy PUT", {})
-rec_span = max(1e-9, rp["_window"]["seconds"])
 verdicts = te.evaluate(ps_all, rule=NOISY_RULE)
-REC_CHECKS = {"recovery_p95_vs_baseline", "noisy_sustained_in_recovery",
-              "critical_not_throttled"}
+REC_CHECKS = {"recovery_vs_reference", "baseline_stable",
+              "critical_p95_within_sla", "paced_client_kept_up",
+              "noisy_sustained_in_recovery", "critical_not_throttled"}
 st5 = te.combine(verdicts["verdicts"], REC_CHECKS)
 why5 = "; ".join(f"{v['name']}={v['verdict']}" for v in verdicts["verdicts"]
                  if v["name"] in REC_CHECKS)
+contact_fails = {p: contact_reason(p) for p in
+                 ("baseline", "contention", "simulation", "pre-baseline",
+                  "reference", "enforced", "recovery", "enforced-24",
+                  "post-baseline") if p in PHASE_AUX}
+contact_fails = {p: r for p, r in contact_fails.items() if r}
+if contact_fails:
+    st5 = "FAIL"
+    why5 = (why5 + "; " if why5 else "") + "; ".join(
+        f"{p}: {r}" for p, r in contact_fails.items())
+rp = ps_all.get("recovery", {})
+rc, rn = rp.get("tenant-critical GET", {}), rp.get("tenant-noisy PUT", {})
+rec_span = max(1e-9, rp.get("_window", {}).get("seconds", 1))
 res = results.write("TC2.5", "recovery observation under sustained throttling",
     status=st5, detail=why5,
     metrics={"baseline_p95": round(ps_all["baseline"].get("tenant-critical GET", {}).get("p95", 0), 1),
+             "pre_baseline_p95": round(ps_all.get("pre-baseline", {}).get("tenant-critical GET", {}).get("p95", 0), 1),
+             "reference_p95": round(ps_all.get("reference", {}).get("tenant-critical GET", {}).get("p95", 0), 1),
+             "post_baseline_p95": round(ps_all.get("post-baseline", {}).get("tenant-critical GET", {}).get("p95", 0), 1),
              "contention_p95": round(ps_all["contention"].get("tenant-critical GET", {}).get("p95", 0), 1),
              "critical_p95": round(rc.get("p95", 0), 1),
              "critical_p99": round(rc.get("p99", 0), 1),
@@ -550,28 +746,28 @@ res = results.write("TC2.5", "recovery observation under sustained throttling",
              "noisy_ok_tps": round(rn.get("ok", 0) / rec_span, 1),
              "noisy_throttled": rn.get("throttled", 0),
              "client_cpu_pct": {ph: ps_all[ph]["_window"]["client_cpu_pct"]
-                                for ph in ("baseline", "contention", "enforced", "recovery")},
-             "recovery_p95_dev_factor": verdicts["thresholds"]["recovery_p95_dev_factor"],
+                                for ph in ("baseline", "contention", "reference",
+                                           "enforced", "recovery", "post-baseline")
+                                if ph in ps_all},
              "checks": {v["name"]: v["detail"] for v in verdicts["verdicts"]
-                        if v["name"] in REC_CHECKS}})
+                        if v["name"] in REC_CHECKS},
+             "phase_aux": {p: aux_metrics(p) for p in PHASE_AUX}})
 viz.banner(st5, "TC2.5 recovery",
            f"critical p95 {rc.get('p95', 0):.0f} ms (baseline "
-           f"{res['metrics']['baseline_p95']:.0f}, contention "
-           f"{res['metrics']['contention_p95']:.0f}); noisy still offering "
+           f"{res['metrics']['baseline_p95']:.0f}, reference "
+           f"{res['metrics']['reference_p95']:.0f}); noisy still offering "
            f"{rn.get('n', 0) / rec_span:.0f} req/s")
 '''),
  notes("The mechanism is the already-running enforcement, observed longer "
-       "— not a second action. The rule still admits ~50 noisy PUT/s by "
-       "design, so the critical workload shares the system with that "
-       "admitted load; the recovery threshold is the customer's to set "
-       "(te.DEFAULT_THRESHOLDS)."),
- md("## Step 9 — Prefix-scoped rule (TC2.6)\n"
+       "— not a second action. recovery_vs_reference is the scored "
+       "isolation verdict; recovery_p95_vs_baseline is information only "
+       "because single-host CPU noise made it unfair."),
+ md("## Step 12 — Prefix-scoped rule (TC2.6)\n"
     "The second rule caps the noisy tenant at 10 TPS under "
-    "`<run_id>/raw/*` only. Real traffic decides: the main noisy load is "
-    "paused, then the same tenant sends one PUT burst to the covered prefix "
-    "and one to a control prefix (`<run_id>/curated/`). PASS only if the "
-    "covered prefix is held at its limit while the control prefix runs "
-    "clearly above it (it stays under the tenant-wide 50 TPS rule)."),
+    "`<run_id>/raw/*` only. Real traffic decides: one PUT burst to the "
+    "covered prefix and one to a control prefix (`<run_id>/curated/`). "
+    "PASS only if the covered prefix is held at its limit while the "
+    "control prefix runs clearly above it."),
  py('''
 lg.pause_noisy(); time.sleep(3)
 lg.start_phase("prefix-test"); chart.mark("prefix bursts")
@@ -584,25 +780,28 @@ if PREFIX_RULE["id"] not in stored:
 cols = ("n", "ok", "ok_tps", "throttled", "r429", "errors", "ok_p95", "seconds")
 viz.table(pd.DataFrame([{"prefix": "covered  " + COVERED, **{k: round(cov[k], 1) for k in cols}},
                         {"prefix": "control  " + CONTROL, **{k: round(ctl[k], 1) for k in cols}}]))
+aux = finish_phase("prefix-test")
 res = results.write("TC2.6", "prefix-scoped rule", status=pfx["status"], detail=pfx["reason"],
     metrics={"prefix_limit_tps": PREFIX_LIMIT, "tenant_limit_tps": LIMIT,
              "rule_path": PREFIX_RULE["filters"]["paths"]["values"][0],
              "covered": {k: round(cov[k], 1) for k in cols},
              "control": {k: round(ctl[k], 1) for k in cols},
-             "covered_codes": cov["codes"], "control_codes": ctl["codes"]})
+             "covered_codes": cov["codes"], "control_codes": ctl["codes"],
+             **aux_metrics("prefix-test")})
 viz.banner(pfx["status"], "TC2.6 prefix rule", pfx["reason"])
 lg.resume_noisy()
 '''),
  notes("Both bursts use the tenant-noisy identity with retries off. The "
        "control prefix is still subject to the tenant-wide rule, so it is "
        "expected near 50 TPS, the covered prefix near 10."),
- md("## Step 10 — Spark write as the throttled tenant (TC2.7)\n"
+ md("## Step 13 — Spark write as the throttled tenant (TC2.7)\n"
     "The same Spark job runs twice while the noisy load keeps the tenant at "
     "its limit: first as **poc-admin** (not targeted by the rule), then — "
     "in a session rebuilt with the **tenant-noisy** S3A identity — under "
     "the enforced rule. PASS: the throttled job completes and throttling "
     "was demonstrably active while it ran."),
  py('''
+lg.add_noisy(threads=6)
 lg.start_phase("spark-write"); chart.mark("spark writes")
 
 def spark_write(session, label):
@@ -626,6 +825,7 @@ s3a_stats = sh.s3a_committer_stats(config.BUCKET_THROTTLE, target) if not job_er
 s3a_throttled = sum(v for k, v in s3a_stats.items()
                     if "throttl" in k and isinstance(v, (int, float)))
 mode_now = thr.get_mode()
+aux = finish_phase("spark-write")
 if job_error:
     st7, why7 = "FAIL", f"Spark write as tenant-noisy failed: {job_error}"
 elif ident["s3a"] != "noisy":
@@ -633,6 +833,8 @@ elif ident["s3a"] != "noisy":
 elif mode_now != "enabled" or not (during.get("throttled", 0) or s3a_throttled):
     st7, why7 = "INCONCLUSIVE", (f"job completed in {t_noisy}s, but no throttling was "
                                  f"observed for tenant-noisy while it ran (mode={mode_now})")
+elif contact_reason("spark-write"):
+    st7, why7 = "FAIL", contact_reason("spark-write")
 else:
     st7, why7 = "PASS", (f"completed under enforcement in {t_noisy}s vs {t_admin}s as "
                          f"poc-admin ({t_noisy / max(t_admin, 0.1):.1f}x); "
@@ -645,7 +847,8 @@ res = results.write("TC2.7", "spark write as throttled tenant", status=st7, deta
              "tenant_noisy_429_during_job": during.get("throttled", 0),
              "tenant_noisy_ok_tps_during_job": round(
                  during.get("ok", 0) / max(1e-9, time.time() - t_start), 1),
-             "s3a_committer_stats": s3a_stats})
+             "s3a_committer_stats": s3a_stats,
+             **aux_metrics("spark-write")})
 viz.table(pd.DataFrame([{"identity": "poc-admin (not in the rule)", "seconds": t_admin},
                         {"identity": "tenant-noisy (rule enforced)", "seconds": t_noisy}]))
 viz.banner(st7, "TC2.7 Spark under throttling", why7)
@@ -655,9 +858,10 @@ viz.banner(st7, "TC2.7 Spark under throttling", why7)
        "(fs.s3a.retry.throttle.*), so the job slows down instead of "
        "failing. The 429 count is the tenant's LoadGen view during the "
        "job; S3A's own counters are shown when the committer reports them."),
- md("## Step 11 — Stop the load: worker lifecycle (TC2.11)\n"
+ md("## Step 14 — Stop the load: worker lifecycle (TC2.11)\n"
     "Stop and restart the noisy group once to prove it restarts safely, "
-    "then stop every worker."),
+    "then stop every worker. lg.stop() also does the final remote flush so "
+    "no tail events are dropped."),
  py('''
 leftover = lg.stop_noisy()
 restarted = lg.add_noisy(1) == 1
@@ -665,7 +869,8 @@ time.sleep(3)
 restarted = restarted and lg.running("tenant-noisy")
 leftover += lg.stop()
 res = results.write("TC2.11", "worker lifecycle", restarted and leftover == 0,
-                    {"noisy_restartable": restarted, "lingering_workers": leftover})
+                    {"noisy_restartable": restarted, "lingering_workers": leftover,
+                     "settle_error": lg.last_settle_error})
 viz.banner(res["status"], "TC2.11 worker lifecycle",
            "restart ok, no lingering workers" if res["passed"]
            else f"restartable={restarted}, lingering={leftover}")
@@ -674,7 +879,7 @@ viz.banner(res["status"], "TC2.11 worker lifecycle",
        "is kept in the count instead of being forgotten. In remote mode the "
        "same calls go to the agent on the noisy host and lg.stop() also "
        "closes the event poller."),
- md("## Step 12 — Verdicts + server-side correlation (TC2.9)\n"
+ md("## Step 15 — Verdicts + server-side correlation (TC2.9)\n"
     "Score all phases against the approved thresholds and correlate the "
     "client-side throttle responses with ObjectScale's own counters where "
     "the build exposes them. The status **is** the overall verdict — "
@@ -685,6 +890,24 @@ verdicts = te.evaluate(ps_all, rule=NOISY_RULE)
 srv = te.server_counters(thr)
 rows = [{"check": v["name"], "verdict": v["verdict"], "detail": v["detail"]}
         for v in verdicts["verdicts"]]
+queue_test = None
+if "enforced-24" in ps_all:
+    e6, e24 = ps_all.get("enforced", {}), ps_all["enforced-24"]
+    c6, c24 = e6.get("tenant-critical GET", {}), e24.get("tenant-critical GET", {})
+    n6, n24 = e6.get("tenant-noisy PUT", {}), e24.get("tenant-noisy PUT", {})
+    s6, s24 = e6.get("_window", {}).get("seconds", 1), e24.get("_window", {}).get("seconds", 1)
+    queue_test = {"critical_p95_6_threads": round(c6.get("p95", 0), 1),
+                  "critical_p95_24_threads": round(c24.get("p95", 0), 1),
+                  "noisy_ok_tps_6": round(n6.get("ok", 0) / max(1e-9, s6), 1),
+                  "noisy_ok_tps_24": round(n24.get("ok", 0) / max(1e-9, s24), 1),
+                  "critical_missed_24": e24.get("tenant-critical GET_missed", 0)}
+    print("queue probe:", queue_test)
+contact_fails = {p: contact_reason(p) for p in PHASE_AUX}
+contact_fails = {p: r for p, r in contact_fails.items() if r}
+if contact_fails:
+    verdicts["overall"] = "FAIL"
+    rows.append({"check": "remote_contact_or_clock", "verdict": "FAIL",
+                 "detail": "; ".join(f"{p}: {r}" for p, r in contact_fails.items())})
 display(pd.DataFrame(rows).style.apply(viz.status_style, column="verdict", axis=1))
 corr = {"client_throttled_enforced_phase": ps_all.get("enforced", {}).get(
             "tenant-noisy PUT", {}).get("throttled", 0),
@@ -698,22 +921,30 @@ res = results.write("TC2.9", "verdicts + correlation", status=verdicts["overall"
                     metrics={"overall": verdicts["overall"],
                              "enforcement_mode": verdicts["enforcement_mode"],
                              "thresholds": verdicts["thresholds"],
-                             "verdicts": rows, **corr})
+                             "verdicts": rows, **corr,
+                             "queue_test": queue_test,
+                             "clock_offsets": {p: a.get("clock_offset_ms")
+                                               for p, a in PHASE_AUX.items()},
+                             "contact_failures": contact_fails})
 viz.banner(verdicts["overall"], "TC2.9 overall verdict",
            f"enforcement mode: {verdicts['enforcement_mode']}")
 '''),
  notes("A 50 TPS limit does not yield exactly 50 ok/s — the thresholds "
        "carry a stated tolerance. They are customer-approved values in "
-       "te.DEFAULT_THRESHOLDS, not tuned to the result."),
- md("## Step 13 — Phase summary\n"
+       "te.DEFAULT_THRESHOLDS, not tuned to the result. recovery_vs_"
+       "reference is the scored isolation verdict; recovery_p95_vs_"
+       "baseline is information only."),
+ md("## Step 16 — Phase summary\n"
     "Every phase side by side: request counts, TPS, latencies, throttle "
-    "responses, errors."),
+    "responses, errors, paced slots and client CPU."),
  py('''
 summary = [{"phase": ph, "client_cpu_pct": gs["_window"]["client_cpu_pct"],
             "workload": k, "n": v["n"], "tps": round(v["tps"], 1),
             "ok_p50": round(v["ok_p50"]), "ok_p95": round(v["ok_p95"]),
             "ok_p99": round(v["ok_p99"]), "throttled": v["throttled"],
-            "r429": v["r429"], "errors": v["errors"], "boundary": v["boundary"]}
+            "r429": v["r429"], "errors": v["errors"], "boundary": v["boundary"],
+            "paced": gs.get("tenant-critical GET_paced"),
+            "missed": gs.get("tenant-critical GET_missed")}
            for ph, gs in ps_all.items() for k, v in gs.items() if k != "_window"]
 viz.table(pd.DataFrame(summary))
 chart.refresh(out, seconds=2)
@@ -722,7 +953,7 @@ chart.refresh(out, seconds=2)
        "that phase. Shaded bands mark the phases; the dotted line is the throttled "
        "(429) rate. `boundary` counts requests that were still in flight "
        "when their phase ended."),
- md("## Step 14 — Restore (TC2.8)\n"
+ md("## Step 17 — Restore (TC2.8)\n"
     "Restore the pre-demo throttler backup and verify the live state "
     "against the backup file — mode, response code and rule IDs."),
  py('''

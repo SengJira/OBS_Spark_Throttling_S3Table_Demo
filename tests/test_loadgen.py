@@ -454,7 +454,7 @@ def _stats(noisy_ok, noisy_thr, crit_p95, rec_p95, base_p95,
            enforced_s=120, contention_n=10000, sim_thr=0,
            rec_noisy_n=12000, rec_crit_thr=0,
            enf_noisy_p95=0, cont_noisy_p95=15):
-    return {
+    out = {
         "baseline": {"tenant-critical GET": _g(500, p95=base_p95),
                      "_window": {"seconds": 60}},
         "contention": {"tenant-noisy PUT": _g(250, n=contention_n,
@@ -475,7 +475,17 @@ def _stats(noisy_ok, noisy_thr, crit_p95, rec_p95, base_p95,
                                             thr=rec_noisy_n // 3),
                      "tenant-critical GET": _g(500, p95=rec_p95,
                                                thr=rec_crit_thr),
-                     "_window": {"seconds": 60}}}
+                     "_window": {"seconds": 60}},
+        "pre-baseline": {"tenant-critical GET": _g(100, p95=base_p95),
+                         "_window": {"seconds": 60}},
+        "reference": {"tenant-critical GET": _g(100, p95=base_p95),
+                      "_window": {"seconds": 60}},
+        "post-baseline": {"tenant-critical GET": _g(100, p95=base_p95),
+                          "_window": {"seconds": 60}}}
+    for ph in out.values():
+        ph.setdefault("tenant-critical GET_paced", 6000)
+        ph.setdefault("tenant-critical GET_missed", 0)
+    return out
 
 
 def test_evaluate_pass_when_enforced():
@@ -728,3 +738,42 @@ def test_cpu_pct_and_phase_window_reports_client_cpu():
     lg.start(noisy=False, critical=True); lg.start_phase("p"); time.sleep(0.3); lg.stop()
     cpu = lg.phase_stats()["p"]["_window"]["client_cpu_pct"]
     assert cpu is None or 0 <= cpu <= 100
+
+
+def test_settle_waits_for_local_inflight_tail(monkeypatch):
+    monkeypatch.setattr(FakeS3, "latency_s", 0.05)
+    lg = loadgen.LoadGen(bucket="b", max_keys=0, run_id="demo-test",
+                         timeout_s=(1, 2))
+    lg.add_noisy(threads=3)
+    lg.start_phase("p")
+    time.sleep(0.15)
+    end = time.time()
+    lg.settle(end, timeout_s=5)
+    n1 = sum(1 for e in lg.events
+             if e.tenant == "tenant-noisy" and e.ts < end)
+    time.sleep(0.3)
+    n2 = sum(1 for e in lg.events
+             if e.tenant == "tenant-noisy" and e.ts < end)
+    assert n1 == n2 and n1 > 0
+    lg.stop()
+
+
+def test_evaluate_drift_makes_recovery_inconclusive():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    st["post-baseline"]["tenant-critical GET"]["p95"] = 30
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["baseline_stable"] == "FAIL"
+    assert names["recovery_vs_reference"] == "INCONCLUSIVE"
+    assert out["overall"] == "FAIL"
+
+
+def test_evaluate_paced_client_misses_are_inconclusive():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    st["baseline"]["tenant-critical GET_missed"] = 5000
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["paced_client_kept_up"] == "INCONCLUSIVE"
+    assert out["overall"] == "INCONCLUSIVE"

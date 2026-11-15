@@ -9,6 +9,7 @@ pulls events back; phase attribution stays on U01 by request-start timestamp.
 
 Run as a service:  python -m poc.noisy_agent   (see systemd/noisy-agent.service)
 """
+import hmac
 import json
 import logging
 import threading
@@ -33,15 +34,46 @@ class AgentState:
         self._s3_checked = (0.0, None)
         self.idle_stopped = False
         self.watchdog_stop = threading.Event()
+        self.event_seq = 0
+        self.event_log = []
+        self.event_lock = threading.Lock()
+
+    def _on_event(self, ev):
+        rec = {"ts": ev.ts, "tenant": ev.tenant, "op": ev.op,
+               "lat_ms": ev.lat_ms, "status": ev.status, "code": ev.code,
+               "retries": ev.retries, "phase": ev.phase}
+        with self.event_lock:
+            self.event_seq += 1
+            rec["seq"] = self.event_seq
+            self.event_log.append(rec)
+
+    def events_since(self, since):
+        with self.event_lock:
+            start = max(0, int(since))
+            if start >= len(self.event_log):
+                return [], self.event_seq
+            return list(self.event_log[start:]), self.event_seq
+
+    def inflight_info(self):
+        if self.lg is None:
+            return 0, None
+        with self.lg._lock:
+            vals = list(self.lg._inflight.values())
+        if not vals:
+            return 0, None
+        return len(vals), min(ts for _, ts in vals)
 
     def touch(self):
         self.last_seen = time.time()
 
     def noisy_status(self):
+        inflight, oldest = self.inflight_info()
+        base = {"inflight": inflight, "oldest_inflight_ts": oldest,
+                "event_cursor": self.event_seq}
         if self.lg is None:
-            return {"running": False, "threads": 0, "lingering": 0,
+            return {**base, "running": False, "threads": 0, "lingering": 0,
                     "totals": {"events": 0}}
-        return {"running": self.lg.running("tenant-noisy"),
+        return {**base, "running": self.lg.running("tenant-noisy"),
                 "threads": len(self.lg.threads["tenant-noisy"]),
                 "lingering": self.lg.lingering("tenant-noisy"),
                 "totals": self.lg.totals()}
@@ -56,16 +88,17 @@ class AgentState:
                   "chunk": int(body.get("chunk", loadgen.CHUNK)),
                   "timeout_s": tuple(body.get("timeout_s") or (3, 10))}
         with self.lock:
-            if (self.lg is not None and self.params == params
-                    and self.lg.running("tenant-noisy")):
-                return self.lg
             if self.lg is not None and self.lg.running("tenant-noisy"):
-                return self.lg          # never replace a live generator
+                old_run = (self.params or {}).get("run_id")
+                if old_run == run_id:
+                    return self.lg       # same run: reuse the live generator
+                self.lg.stop_noisy()     # different run: never reuse it
             self.lg = loadgen.LoadGen(run_id=params["run_id"],
                                       bucket=params["bucket"],
                                       max_keys=params["max_keys"],
                                       chunk=params["chunk"],
                                       timeout_s=params["timeout_s"])
+            self.lg.event_sink = self._on_event
             self.params = params
             self.idle_stopped = False
             return self.lg
@@ -158,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
         state = self.server.state
         want = state.token
         got = self.headers.get("X-POC-Token", "")
-        if want and got != want:
+        if want and not hmac.compare_digest(got, want):
             self._json({"ok": False, "error": "bad token"}, 401)
             return False
         state.touch()
@@ -189,17 +222,18 @@ class Handler(BaseHTTPRequestHandler):
                             "s3": state.s3_status()})
             elif path == "/status":
                 self._json({"ok": True, "agent_time": time.time(),
+                            "event_cursor": state.event_seq,
+                            "events_total": state.event_seq,
                             "noisy": state.noisy_status(),
                             "idle_stopped": state.idle_stopped})
             elif path == "/events":
                 since = int(self._qs().get("since", ["0"])[0])
-                if state.lg is None:
-                    self._json({"events": [], "cursor": since,
-                                "agent_time": time.time()})
-                    return
-                evs, cur = state.lg.events_since(since)
-                self._json({"events": [_event_json(e) for e in evs],
-                            "cursor": cur, "agent_time": time.time()})
+                evs, cur = state.events_since(since)
+                inflight, oldest = state.inflight_info()
+                self._json({"events": evs, "cursor": cur,
+                            "inflight": inflight,
+                            "oldest_inflight_ts": oldest,
+                            "agent_time": time.time()})
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
         except Exception as e:
@@ -212,6 +246,9 @@ class Handler(BaseHTTPRequestHandler):
         state = self.server.state
         path = urllib.parse.urlparse(self.path).path
         try:
+            if int(self.headers.get("Content-Length") or 0) > 65536:
+                self._json({"ok": False, "error": "request body too large"}, 413)
+                return
             body = self._body()
             if path == "/preflight":
                 run_id = body.get("run_id")
@@ -221,12 +258,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(state.preflight(run_id))
             elif path == "/noisy/start":
                 lg = state.ensure_lg(body)
-                n = lg.add_noisy(int(body.get("threads", 6)))
+                n = lg.add_noisy(int(body.get("threads", 6)),
+                                 rate=body.get("rate"))
                 self._json({"ok": True, "launched": n,
                             "running": lg.running("tenant-noisy"),
                             "threads": len(lg.threads["tenant-noisy"]),
                             "lingering": lg.lingering("tenant-noisy"),
                             "run_id": lg.run_id})
+            elif path == "/noisy/rate":
+                if state.lg is None:
+                    self._json({"ok": False, "error": "no generator"}, 409)
+                    return
+                state.lg.set_noisy_rate(body.get("rate"))
+                self._json({"ok": True})
             elif path == "/noisy/stop":
                 n = state.lg.stop_noisy() if state.lg is not None else 0
                 self._json({"ok": True, "lingering": n,
@@ -265,11 +309,13 @@ def main():
                         format="%(asctime)s %(levelname)s %(message)s")
     state = AgentState(token=config.NOISY_AGENT_TOKEN,
                        idle_s=config.NOISY_AGENT_IDLE_S)
-    host = config.NOISY_AGENT_BIND or "0.0.0.0"
+    host = config.NOISY_AGENT_BIND
     port = int(config.NOISY_AGENT_PORT)
-    if not state.token and host not in ("127.0.0.1", "localhost", "::1"):
-        raise SystemExit("NOISY_AGENT_TOKEN is required when the agent binds "
-                         "beyond loopback")
+    if not host:
+        raise SystemExit("NOISY_AGENT_BIND must be set to the agent's own "
+                         "address (for example 192.168.1.41)")
+    if not state.token:
+        raise SystemExit("NOISY_AGENT_TOKEN is required")
     srv = create_server(host, port, state)
     wd = threading.Thread(target=state.watchdog, daemon=True)
     wd.start()

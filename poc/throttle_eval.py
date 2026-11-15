@@ -26,6 +26,10 @@ DEFAULT_THRESHOLDS = {
     "min_offer_factor": 0.8,          # enforced offer < limit*factor => load
                                     # not sustained => INCONCLUSIVE
     "critical_throttle_max": 0,       # critical GET 429/SlowDown count allowed
+    "baseline_stable_factor": 1.25,   # post-baseline p95 <= factor*max(baseline,pre)
+    "recovery_ref_factor": 1.25,      # recovery p95 <= factor*reference p95
+    "recovery_ref_abs_ms": 2.0,       # ... or reference p95 + this many ms
+    "max_missed_slot_pct": 1.0,       # paced client misses => INCONCLUSIVE
 }
 
 # Rule schema, confirmed live against PUT /throttle/config and
@@ -354,6 +358,9 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
     rec_crit = rec.get(critical_group, {})
     rec_noisy = rec.get(noisy_group, {})
     rec_span = rec.get("_window", {}).get("seconds", 1)
+    pre_base = ps.get("pre-baseline", {}).get(critical_group, {})
+    post_base = ps.get("post-baseline", {}).get(critical_group, {})
+    reference = ps.get("reference", {}).get(critical_group, {})
 
     lim = ((rule or {}).get("limit") or {}).get("value")
     det_active, enforcement_mode = detect(
@@ -369,6 +376,40 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
            "enforcement_mode": enforcement_mode, "thresholds": th,
            "rule_limit": lim, "verdicts": []}
     v = out["verdicts"]
+
+    # -1. environment drift guard: the post-baseline critical-alone phase must
+    #     stay close to the best earlier critical-alone measurement.
+    base_p95s = [g.get("p95", 0) for g in (base, pre_base)
+                 if g.get("n", 0) >= th["min_requests"]]
+    if post_base.get("n", 0) >= th["min_requests"] and base_p95s:
+        ref = max(base_p95s)
+        drift = post_base["p95"] / max(1e-9, ref)
+        v.append(_verdict("baseline_stable",
+                          drift <= th["baseline_stable_factor"],
+                          f"post-baseline p95={post_base['p95']:.1f}ms vs "
+                          f"best baseline {ref:.1f}ms ({drift:.2f}x)"))
+    else:
+        v.append(_verdict("baseline_stable", False,
+                          "insufficient baseline/post-baseline data",
+                          data_ok=False))
+
+    # paced-client guard: too many missed slots means the client, not the
+    # throttler, decided the latency numbers.
+    paced_phases = [ph for ph in ps.values()
+                    if ph.get("tenant-critical GET_paced")]
+    missed = sum(ph.get("tenant-critical GET_missed", 0)
+                 for ph in paced_phases)
+    paced = sum(ph.get("tenant-critical GET_paced", 0)
+                for ph in paced_phases)
+    if paced:
+        pct_missed = 100.0 * missed / max(1, paced)
+        # too many missed slots means the client, not the throttler, decided
+        # the latency numbers — that is INCONCLUSIVE, never a FAIL
+        v.append({"name": "paced_client_kept_up",
+                  "verdict": "PASS" if pct_missed <= th["max_missed_slot_pct"]
+                             else "INCONCLUSIVE",
+                  "detail": f"{missed}/{paced} critical slots missed "
+                            f"({pct_missed:.2f}%)"})
 
     # 0. noisy load actually sustained during the enforcement window.
     #    Whenever enforcement is active, completions are capped near the
@@ -453,13 +494,15 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
                       f"(throttle events may stay elevated — expected)",
                       data_ok=rec_noisy.get("n", 0) > 0))
 
-    # 3. critical GET SLA under enforcement
+    # 3. critical GET SLA under enforcement AND during recovery
+    sla_p95 = max(enfc_crit.get("p95", 0), rec_crit.get("p95", 0))
     v.append(_verdict("critical_p95_within_sla",
-                      enfc_crit.get("p95", 0) <= th["critical_p95_max_ms"],
-                      f"p95={enfc_crit.get('p95',0):.1f}ms / "
-                      f"p99={enfc_crit.get('p99',0):.1f}ms vs SLA "
+                      sla_p95 <= th["critical_p95_max_ms"],
+                      f"enforced p95={enfc_crit.get('p95',0):.1f}ms / "
+                      f"recovery p95={rec_crit.get('p95',0):.1f}ms vs SLA "
                       f"{th['critical_p95_max_ms']}ms",
-                      data_ok=enfc_crit.get("n", 0) >= th["min_requests"]))
+                      data_ok=(enfc_crit.get("n", 0) >= th["min_requests"]
+                               and rec_crit.get("n", 0) >= th["min_requests"])))
 
     # 4. critical GET error rate
     cn = max(1, enfc_crit.get("n", 0))
@@ -468,25 +511,46 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
                       f"{err*100:.2f}% ({enfc_crit.get('errors',0)}/{cn})",
                       data_ok=enfc_crit.get("n", 0) >= th["min_requests"]))
 
-    # 5. recovery vs baseline p95 (noisy still running — protected by rule).
-    #    Meaningful only when enforcement was observed; without it the phase
-    #    just re-measures contention, so the verdict is INCONCLUSIVE.
+    # 4b. main isolation verdict: recovery vs the paced-at-limit reference.
+    if (rec_crit.get("n", 0) >= th["min_requests"]
+            and reference.get("n", 0) >= th["min_requests"]):
+        ref_p95 = reference["p95"]
+        bound = max(th["recovery_ref_factor"] * ref_p95,
+                    ref_p95 + th["recovery_ref_abs_ms"])
+        drifted = any(v["name"] == "baseline_stable" and v["verdict"] != "PASS"
+                      for v in v)
+        ok = rec_crit["p95"] <= bound and enforcement_active and not drifted
+        verdict = ("INCONCLUSIVE" if (not enforcement_active or drifted)
+                   else ("PASS" if ok else "FAIL"))
+        v.append({"name": "recovery_vs_reference", "verdict": verdict,
+                  "detail": f"recovery p95={rec_crit['p95']:.1f}ms vs "
+                            f"reference {ref_p95:.1f}ms (bound {bound:.1f}ms); "
+                            f"enforcement={'yes' if enforcement_active else 'no'}"})
+    else:
+        v.append({"name": "recovery_vs_reference", "verdict": "INCONCLUSIVE",
+                  "detail": "insufficient reference/recovery data"})
+
+    # 5. recovery vs baseline p95 — INFORMATION ONLY (single-host CPU noise
+    #    made this check unfair; recovery_vs_reference is the scored verdict)
     if rec_crit.get("n", 0) >= th["min_requests"] and base.get("p95"):
         dev = rec_crit["p95"] / max(1e-9, base["p95"])
         detail = (f"recovery p95={rec_crit['p95']:.1f}ms "
                   f"(p99={rec_crit.get('p99',0):.1f}) = {dev:.2f}x "
                   f"baseline ({base['p95']:.1f}ms)")
-        v.append(_verdict("recovery_p95_vs_baseline",
-                          dev <= th["recovery_p95_dev_factor"],
-                          detail if enforcement_active
-                          else detail + " — enforcement never observed",
-                          data_ok=enforcement_active))
+        v.append({"name": "recovery_p95_vs_baseline", "info": True,
+                  "verdict": ("PASS" if dev <= th["recovery_p95_dev_factor"]
+                              else "FAIL") if enforcement_active
+                  else "INCONCLUSIVE",
+                  "detail": detail if enforcement_active
+                  else detail + " — enforcement never observed"})
     else:
-        v.append(_verdict("recovery_p95_vs_baseline", False,
-                          "insufficient recovery/baseline data", data_ok=False))
+        v.append({"name": "recovery_p95_vs_baseline", "info": True,
+                  "verdict": "INCONCLUSIVE",
+                  "detail": "insufficient recovery/baseline data"})
 
-    fails = [x for x in v if x["verdict"] == "FAIL"]
-    incs = [x for x in v if x["verdict"] == "INCONCLUSIVE"]
+    scored = [x for x in v if not x.get("info")]
+    fails = [x for x in scored if x["verdict"] == "FAIL"]
+    incs = [x for x in scored if x["verdict"] == "INCONCLUSIVE"]
     out["overall"] = ("FAIL" if fails else
                       "INCONCLUSIVE" if incs else "PASS")
     return out

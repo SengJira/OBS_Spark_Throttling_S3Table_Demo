@@ -98,9 +98,13 @@ OBS_BUCKET_THROTTLE = BUCKET_THROTTLE
 NOISY_HOST = get("NOISY_HOST", "")
 NOISY_AGENT_TOKEN = get("NOISY_AGENT_TOKEN", "")
 # noisy-agent.service on the remote host (poc/noisy_agent.py)
-NOISY_AGENT_BIND = get("NOISY_AGENT_BIND", "0.0.0.0")
+NOISY_AGENT_BIND = get("NOISY_AGENT_BIND", "")
 NOISY_AGENT_PORT = int(get("NOISY_AGENT_PORT", "8765") or 8765)
 NOISY_AGENT_IDLE_S = float(get("NOISY_AGENT_IDLE_S", "60") or 60)
+# Open-loop critical GET rate for notebook 02 (req/s); 0 = as fast as possible
+CRITICAL_RATE = float(get("CRITICAL_RATE", "100") or 100)
+# Optional queue-cost probe: 1 adds the enforced-24 noisy phase in notebook 02
+QUEUE_TEST = get("QUEUE_TEST", "0").strip().lower() in ("1", "true", "yes")
 
 USERS = {
     "admin":  (get("POC_ADMIN_AK"),  get("POC_ADMIN_SK")),

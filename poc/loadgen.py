@@ -23,6 +23,7 @@ MAX_KEYS = 20000           # cap noisy objects per run (0 = unlimited)
 CHUNK = 64 * 1024          # 64 KiB payload per PUT
 STATUS_OK = 200
 TENANTS = ("tenant-noisy", "tenant-critical")
+TENANT_OP = {"tenant-noisy": "PUT", "tenant-critical": "GET"}
 
 Event = collections.namedtuple(
     "Event", "ts tenant op lat_ms status code retries phase")
@@ -90,6 +91,45 @@ def pctile(lats, p):
     return s[f] if f == k else s[f] + (s[f + 1] - s[f]) * (k - f)
 
 
+class Pacer:
+    """Open-loop rate limiter shared by a tenant's worker threads. Request k
+    is due at t0 + k/rate; workers sleep until their slot, so offered load is
+    fixed even when the client is slow. Latency is measured from the
+    scheduled slot, and sends more than 50 ms late are counted as missed."""
+
+    def __init__(self, rate):
+        self.rate = rate
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._t0 = time.monotonic()
+        self.sent = 0
+        self.missed = 0
+
+    def acquire(self):
+        """Wait for this thread's slot; returns the scheduled monotonic time
+        (None when pacing is disabled)."""
+        if not self.rate:
+            return None
+        with self._lock:
+            k = self._seq
+            self._seq += 1
+        due = self._t0 + k / self.rate
+        delay = due - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        sent = time.monotonic()
+        if sent > due + 0.05:
+            with self._lock:
+                self.missed += 1
+        with self._lock:
+            self.sent += 1
+        return due
+
+    def counts(self):
+        with self._lock:
+            return self.sent, self.missed
+
+
 class LoadGen:
     def __init__(self, bucket=config.OBS_BUCKET_THROTTLE, chunk=CHUNK,
                  max_keys=MAX_KEYS, timeout_s=(3, 10), run_id=None):
@@ -115,6 +155,12 @@ class LoadGen:
         self._worker_seq = itertools.count(1)
         self._payload = b"x" * chunk
         self.seed_key = None
+        self.event_sink = None          # optional per-event callback (agent)
+        self.last_settle_error = None
+        self._inflight = {}             # token -> (tenant, request-start ts)
+        self._inflight_seq = itertools.count(1)
+        self._pacers = {"tenant-noisy": None, "tenant-critical": None}
+        self._phase_pacer_start = {}
         self.phases = []                    # [{name,tag,start,end,seconds}]
         self._phase = "init"
         self._phase_tag = None
@@ -140,20 +186,36 @@ class LoadGen:
             self._phase_start = time.time()
             self._phase_start_m = time.monotonic()
             self._phase_cpu = cpu_times()
+            self._phase_pacer_start = {
+                t: (p.counts() if p is not None else None)
+                for t, p in self._pacers.items()}
 
     def _close_phase_locked(self, wall, mono):
         if self._phase_tag is not None and self._phase_start is not None:
-            self.phases.append({"name": self._phase, "tag": self._phase_tag,
-                                "start": self._phase_start, "end": wall,
-                                "seconds": mono - self._phase_start_m,
-                                "client_cpu_pct": cpu_pct(self._phase_cpu,
-                                                          cpu_times())})
+            entry = {"name": self._phase, "tag": self._phase_tag,
+                     "start": self._phase_start, "end": wall,
+                     "seconds": mono - self._phase_start_m,
+                     "client_cpu_pct": cpu_pct(self._phase_cpu,
+                                               cpu_times())}
+            for t, p in self._pacers.items():
+                if p is None:
+                    continue
+                before = self._phase_pacer_start.get(t)
+                after = p.counts()
+                if before:
+                    op = TENANT_OP.get(t, t)
+                    entry[f"{t} {op}_paced"] = after[0] - before[0]
+                    entry[f"{t} {op}_missed"] = after[1] - before[1]
+            self.phases.append(entry)
 
     def end_phase(self):
+        """Close the open phase; returns its wall-clock end timestamp."""
         with self._lock:
-            self._close_phase_locked(time.time(), time.monotonic())
+            wall = time.time()
+            self._close_phase_locked(wall, time.monotonic())
             self._phase, self._phase_tag = "idle", None
             self._phase_start = self._phase_start_m = None
+            return wall
 
     @property
     def phase(self):
@@ -166,6 +228,14 @@ class LoadGen:
             return self._phase_tag
 
     # ---------- metrics ----------
+    def _emit(self, ev):
+        sink = self.event_sink
+        if sink is not None:
+            try:
+                sink(ev)
+            except Exception:
+                pass
+
     def _rec(self, tenant, op, ts, latency_ms, status, code="", retries=0,
              tag=None):
         ev = Event(ts, tenant, op, latency_ms, status, code, retries,
@@ -178,6 +248,7 @@ class LoadGen:
                          "throttled" if cls in THROTTLED else "errors"] += 1
             self._agg_buf[ev.phase][f"{tenant} {op}"].append(
                 (ts, latency_ms, status, code, retries))
+        self._emit(ev)
 
     def _phase_tag_for_ts(self, ts):
         """Phase tag for a request that STARTED at wall time `ts`: closed
@@ -215,6 +286,7 @@ class LoadGen:
                          "throttled" if cls in THROTTLED else "errors"] += 1
             self._agg_buf[tag][f"{tenant} {op}"].append(
                 (ts, latency_ms, status, code, retries))
+        self._emit(ev)
 
     def attach_remote(self, remote):
         """Delegate noisy-tenant control/events to a RemoteNoisy client."""
@@ -318,8 +390,61 @@ class LoadGen:
             out[key] = {"_window": {"start": ph["start"], "end": ph["end"],
                                     "seconds": round(ph["seconds"], 1),
                                     "client_cpu_pct": ph.get("client_cpu_pct")},
+                        **{k: v for k, v in ph.items()
+                           if k.endswith("_paced") or k.endswith("_missed")},
                         **groups}
         return out
+
+    def phase_window(self, name):
+        """(start, end) of the most recent phase called `name`; end is now
+        for the still-open phase."""
+        entries = list(self.phases)
+        with self._lock:
+            if self._phase == name and self._phase_start is not None:
+                entries.append({"name": name, "start": self._phase_start,
+                                "end": time.time()})
+        for ph in reversed(entries):
+            if ph["name"] == name:
+                return ph["start"], ph["end"]
+        return None
+
+    # ---------- in-flight tracking / settle ----------
+    def _inflight_start(self, tenant, ts):
+        tok = next(self._inflight_seq)
+        with self._lock:
+            self._inflight[tok] = (tenant, ts)
+        return tok
+
+    def _inflight_end(self, tok):
+        with self._lock:
+            self._inflight.pop(tok, None)
+
+    def _inflight_before(self, until_ts):
+        with self._lock:
+            return sum(1 for _, ts in self._inflight.values() if ts < until_ts)
+
+    def _wait_local_inflight(self, until_ts, timeout_s=30):
+        deadline = time.time() + timeout_s
+        while self._inflight_before(until_ts):
+            if time.time() > deadline:
+                raise TimeoutError("local in-flight requests did not settle")
+            time.sleep(0.05)
+
+    def settle(self, phase_end_ts, timeout_s=30):
+        """Wait until every request that STARTED before `phase_end_ts` has
+        been recorded, so phase_stats() cannot miss the slow tail. Local
+        in-flight requests (critical in remote mode, both tenants locally)
+        are awaited directly; remote noisy events go through
+        RemoteNoisy.flush()."""
+        try:
+            self._wait_local_inflight(phase_end_ts, timeout_s=timeout_s)
+            if self.remote_noisy is not None \
+                    and not getattr(self.remote_noisy, "closed", False):
+                self.remote_noisy.flush(phase_end_ts, timeout_s=timeout_s)
+            self.last_settle_error = None
+        except Exception as e:
+            self.last_settle_error = str(e)
+            raise
 
     def totals(self):
         """Running totals since start (O(1): kept by _rec, not rescanned)."""
@@ -375,7 +500,11 @@ class LoadGen:
                 time.sleep(0.25); continue
             seq = self._next_key_seq()
             key = f"{rid}/noisy/n{seq}.bin"
-            tag, ts, t0 = self._cur_tag, time.time(), time.monotonic()
+            pacer = self._pacers["tenant-noisy"]
+            due = pacer.acquire() if pacer is not None else None
+            tag, ts = self._cur_tag, time.time()
+            t0 = due if due is not None else time.monotonic()
+            tok = self._inflight_start("tenant-noisy", ts)
             try:
                 r = cli.put_object(Bucket=self.bucket, Key=key,
                                    Body=self._payload,
@@ -390,13 +519,19 @@ class LoadGen:
                           _status(e), _code(e), _retries(e), tag=tag)
                 self._key_done(False)
                 time.sleep(0.05)  # brief backoff on throttle/errors
+            finally:
+                self._inflight_end(tok)
 
     def _critical_get(self, key, interval=0):
         cli = s3util.s3("critical", timeout_s=self.timeout_s, max_attempts=1)
         while not self._stopped("tenant-critical"):
             if self._paused("tenant-critical"):
                 time.sleep(0.25); continue
-            tag, ts, t0 = self._cur_tag, time.time(), time.monotonic()
+            pacer = self._pacers["tenant-critical"]
+            due = pacer.acquire() if pacer is not None else None
+            tag, ts = self._cur_tag, time.time()
+            t0 = due if due is not None else time.monotonic()
+            tok = self._inflight_start("tenant-critical", ts)
             try:
                 r = cli.get_object(Bucket=self.bucket, Key=key)
                 with contextlib.closing(r["Body"]) as body:
@@ -409,6 +544,8 @@ class LoadGen:
                           (time.monotonic()-t0)*1000,
                           _status(e), _code(e), _retries(e), tag=tag)
                 time.sleep(0.05)
+            finally:
+                self._inflight_end(tok)
             if interval:
                 time.sleep(interval)
 
@@ -436,40 +573,47 @@ class LoadGen:
         return local
 
     def start(self, seed_key=None, noisy=True, critical=True,
-              noisy_threads=6, critical_threads=2, critical_interval=0):
-        """Seed one critical object if needed; launch workers.
-        Re-calling on a running generator is a no-op returning the seed."""
-        if self.running():
-            return self.seed_key
+              noisy_threads=6, critical_threads=2, critical_interval=0,
+              noisy_rate=None, critical_rate=None):
+        """Seed one critical object if needed; launch only the requested
+        tenants that are not already running. A running noisy tenant must
+        never prevent critical workers from starting (and vice versa)."""
         if seed_key is None:
-            seed_key = f"{self.run_id}/critical-seed.bin"
-            s3util.s3("critical").put_object(
-                Bucket=self.bucket, Key=seed_key, Body=self._payload)
+            seed_key = self.seed_key or f"{self.run_id}/critical-seed.bin"
+            if not self.running("tenant-critical"):
+                s3util.s3("critical").put_object(
+                    Bucket=self.bucket, Key=seed_key, Body=self._payload)
         self.seed_key = seed_key
         self.stop_flag.clear(); self.paused.clear()
-        for e in self._tenant_stop.values():
-            e.clear()
         if noisy:
-            self.add_noisy(noisy_threads)
+            self._tenant_stop["tenant-noisy"].clear()
+            self._tenant_pause["tenant-noisy"].clear()
         if critical:
-            self.add_critical(critical_threads, seed_key, critical_interval)
+            self._tenant_stop["tenant-critical"].clear()
+            self._tenant_pause["tenant-critical"].clear()
+        if noisy:
+            self.add_noisy(noisy_threads, rate=noisy_rate)
+        if critical:
+            self.add_critical(critical_threads, seed_key, critical_interval,
+                              rate=critical_rate)
         return seed_key
 
-    def add_noisy(self, threads=6):
+    def add_noisy(self, threads=6, rate=None):
         """Launch noisy PUT workers; no-op if any are already alive."""
         if self.remote_noisy is not None:
-            return self.remote_noisy.add_noisy(threads)
+            return self.remote_noisy.add_noisy(threads, rate=rate)
         if self.running("tenant-noisy"):
             return 0
         self._tenant_stop["tenant-noisy"].clear()
         self._tenant_pause["tenant-noisy"].clear()
+        self._pacers["tenant-noisy"] = Pacer(rate) if rate else None
         for _ in range(threads):
             t = threading.Thread(target=self._noisy_put,
                                  args=(next(self._worker_seq),), daemon=True)
             t.start(); self.threads["tenant-noisy"].append(t)
         return threads
 
-    def add_critical(self, threads=2, seed_key=None, interval=0):
+    def add_critical(self, threads=2, seed_key=None, interval=0, rate=None):
         """Launch critical GET workers; no-op if any are already alive."""
         if self.running("tenant-critical"):
             return 0
@@ -478,6 +622,7 @@ class LoadGen:
             seed_key = self.start(noisy=False, critical=False)
         self._tenant_stop["tenant-critical"].clear()
         self._tenant_pause["tenant-critical"].clear()
+        self._pacers["tenant-critical"] = Pacer(rate) if rate else None
         for _ in range(threads):
             t = threading.Thread(target=self._critical_get,
                                  args=(seed_key, interval), daemon=True)
@@ -528,6 +673,14 @@ class LoadGen:
     def pause_critical(self):   self._tenant_pause["tenant-critical"].set()
     def resume_critical(self):  self._tenant_pause["tenant-critical"].clear()
 
+    def set_noisy_rate(self, rate):
+        if self.remote_noisy is not None:
+            self.remote_noisy.set_noisy_rate(rate); return
+        self._pacers["tenant-noisy"] = Pacer(rate) if rate else None
+
+    def set_critical_rate(self, rate):
+        self._pacers["tenant-critical"] = Pacer(rate) if rate else None
+
     def stop(self):
         """Stop all workers. Returns total lingering count."""
         self.stop_flag.set()
@@ -537,6 +690,10 @@ class LoadGen:
         self.end_phase()
         leftover = (self.stop_tenant("tenant-noisy")
                     + self.stop_tenant("tenant-critical"))
+        try:
+            self.settle(time.time())       # final pull: do not drop tail events
+        except Exception as e:
+            self.last_settle_error = str(e)
         if self.remote_noisy is not None:
             self.remote_noisy.close()
         return leftover
@@ -650,22 +807,41 @@ class RemoteNoisy:
         self.poll_s = poll_s
         self.cursor = 0
         self.ingested = 0
+        self.events_pulled = 0
+        self.poll_errors = 0
+        self.max_gap_s = 0.0
         self.last_error = None
+        self.last_error_ts = None
+        self.last_ok = None
+        self._last_poll_ok = None
+        self._bad_since = None
+        self.outages = []
+        self.closed = False
         self._stop = threading.Event()
+        self._poll_lock = threading.Lock()
         lg.attach_remote(self)
+        # Start AFTER the agent's current event cursor so a new client does
+        # not replay the previous run's history into the chart/phase stats.
+        try:
+            st = self.status(timeout=5)
+            self.cursor = int(st.get("event_cursor", st.get("events_total", 0)) or 0)
+            self.last_ok = time.time()
+        except Exception as e:
+            self.last_error = str(e)
+            self.last_error_ts = time.time()
         self._poller = threading.Thread(target=self._poll_loop, daemon=True)
         self._poller.start()
 
     # ---------- HTTP ----------
-    def _headers(self):
+    def _headers(self, ts=None):
         return {"X-POC-Token": self.token,
-                "X-POC-Time": f"{time.time():.6f}",
+                "X-POC-Time": f"{(ts if ts is not None else time.time()):.6f}",
                 "Content-Type": "application/json"}
 
-    def _request(self, method, path, body=None, timeout=10):
+    def _request(self, method, path, body=None, timeout=10, ts=None):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self.base_url + path, data=data,
-                                     headers=self._headers(), method=method)
+                                     headers=self._headers(ts), method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
@@ -679,16 +855,36 @@ class RemoteNoisy:
     def health(self, timeout=10):
         return self._request("GET", "/health", timeout=timeout)
 
+    def measure_clock(self, timeout=10):
+        """Round-trip clock measurement: offset = agent_time - midpoint of
+        the client send/receive wall times, keeping the RTT."""
+        t_send = time.time()
+        h = self._request("GET", "/health", timeout=timeout, ts=t_send)
+        t_recv = time.time()
+        agent_time = h.get("agent_time")
+        if agent_time is None:
+            return {"offset_ms": None, "rtt_ms": (t_recv - t_send) * 1000,
+                    "health": h}
+        mid = (t_send + t_recv) / 2.0
+        return {"offset_ms": (agent_time - mid) * 1000,
+                "rtt_ms": (t_recv - t_send) * 1000,
+                "agent_time": agent_time, "health": h}
+
     def check_clock(self, limit_ms=50.0, timeout=10):
         """Return (offset_ms, health) or raise when the U01/U02 clocks are
         not synchronized closely enough for timestamp phase attribution."""
-        h = self.health(timeout=timeout)
-        off = h.get("offset_ms")
+        m = self.measure_clock(timeout=timeout)
+        off = m.get("offset_ms")
         if off is None or abs(off) > limit_ms:
             raise RemoteNoisyError(
                 f"U01/U02 clock offset {off} ms exceeds {limit_ms:.0f} ms — "
                 "sync chrony on both hosts before running notebook 02")
-        return off, h
+        return off, m["health"]
+
+    def recheck_clock(self, limit_ms=50.0, timeout=10):
+        """Measure at a phase boundary; returns the measurement dict and
+        never raises — the caller decides FAIL/INCONCLUSIVE."""
+        return self.measure_clock(timeout=timeout)
 
     def status(self, timeout=5):
         return self._request("GET", "/status", timeout=timeout)
@@ -712,12 +908,16 @@ class RemoteNoisy:
         return [row, crit], ok
 
     # ---------- noisy controls (same shape as LoadGen) ----------
-    def add_noisy(self, threads=6):
-        res = self._request("POST", "/noisy/start", {
-            "threads": int(threads), "run_id": self.run_id,
-            "bucket": self.bucket, "max_keys": self.max_keys,
-            "chunk": self.chunk, "timeout_s": list(self.timeout_s)}, timeout=15)
+    def add_noisy(self, threads=6, rate=None):
+        body = {"threads": int(threads), "run_id": self.run_id,
+                "bucket": self.bucket, "max_keys": self.max_keys,
+                "chunk": self.chunk, "timeout_s": list(self.timeout_s),
+                "rate": rate}
+        res = self._request("POST", "/noisy/start", body, timeout=15)
         return int(res.get("launched", 0))
+
+    def set_noisy_rate(self, rate):
+        self._request("POST", "/noisy/rate", {"rate": rate}, timeout=10)
 
     def pause_noisy(self):
         self._request("POST", "/noisy/pause", {}, timeout=10)
@@ -752,19 +952,34 @@ class RemoteNoisy:
 
     # ---------- event pull ----------
     def poll(self):
-        res = self._request("GET", f"/events?since={self.cursor}", timeout=15)
-        n = 0
-        for ev in res.get("events", []):
-            if ev.get("tenant") != "tenant-noisy" or ev.get("op") != "PUT":
-                continue
-            self.lg.ingest_event("tenant-noisy", "PUT", ev["ts"],
-                                 ev.get("lat_ms", 0), ev.get("status", 599),
-                                 ev.get("code", ""), ev.get("retries", 0))
-            n += 1
-        self.cursor = int(res.get("cursor", self.cursor))
-        self.ingested += n
-        self.last_error = None
-        return n
+        # The background poller and settle()/flush() share the cursor; without
+        # this lock two pulls can request the same `since` and double-ingest.
+        with self._poll_lock:
+            res = self._request("GET", f"/events?since={self.cursor}",
+                                timeout=15)
+            n = 0
+            for ev in res.get("events", []):
+                if ev.get("tenant") != "tenant-noisy" or ev.get("op") != "PUT":
+                    continue
+                self.lg.ingest_event("tenant-noisy", "PUT", ev["ts"],
+                                     ev.get("lat_ms", 0), ev.get("status", 599),
+                                     ev.get("code", ""), ev.get("retries", 0))
+                n += 1
+            self.cursor = int(res.get("cursor", self.cursor))
+            self.ingested += n
+            self.events_pulled += len(res.get("events", []))
+            self._last_inflight = res.get("inflight")
+            self._last_oldest = res.get("oldest_inflight_ts")
+            now = time.time()
+            if self._last_poll_ok is not None:
+                self.max_gap_s = max(self.max_gap_s, now - self._last_poll_ok)
+            self._last_poll_ok = now
+            self.last_ok = now
+            if self._bad_since is not None:
+                self.outages.append((self._bad_since, now))
+                self._bad_since = None
+            self.last_error = None
+            return n
 
     def _poll_loop(self):
         while not self._stop.is_set():
@@ -772,9 +987,67 @@ class RemoteNoisy:
                 self.poll()
                 self._stop.wait(self.poll_s)
             except Exception as e:
+                self.poll_errors += 1
                 self.last_error = str(e)
+                self.last_error_ts = time.time()
+                if self._bad_since is None:
+                    self._bad_since = self.last_error_ts
                 self._stop.wait(min(10.0, self.poll_s * 5))
 
+    def contact_ok(self, max_age_s=5.0):
+        return self.last_ok is not None and (time.time() - self.last_ok) <= max_age_s
+
+    def max_outage_between(self, t0, t1):
+        """Longest interval inside [t0,t1] with no successful event pull."""
+        spans = list(self.outages)
+        if self._bad_since is not None:
+            spans.append((self._bad_since, time.time()))
+        best = 0.0
+        for a, b in spans:
+            lo, hi = max(a, t0), min(b, t1)
+            if hi > lo:
+                best = max(best, hi - lo)
+        if self.last_ok is not None and self.last_ok < t1:
+            # still failing right now: measure from last success to t1
+            best = max(best, t1 - max(self.last_ok, t0))
+        return best
+
+    def stats(self):
+        now = time.time()
+        return {"events_pulled": self.events_pulled,
+                "events_ingested": self.ingested,
+                "poll_errors": self.poll_errors,
+                "max_gap_s": round(self.max_gap_s, 3),
+                "last_error": self.last_error,
+                "last_error_ts": self.last_error_ts,
+                "last_ok": self.last_ok,
+                "contact_age_s": round(now - self.last_ok, 3)
+                if self.last_ok else None,
+                "contact_ok": self.contact_ok()}
+
+    def flush(self, until_ts, timeout_s=15):
+        """Pull until every request that started before until_ts has been
+        recorded on U01 (agent reports oldest in-flight start time). Two
+        consecutive clean polls are required so an event appended between
+        the status snapshot and the cursor pull cannot slip through."""
+        deadline = time.time() + timeout_s
+        clean = 0
+        while True:
+            self.poll()
+            oldest = self._last_oldest
+            if oldest is None or oldest >= until_ts:
+                clean += 1
+                if clean >= 2:
+                    return
+            else:
+                clean = 0
+            if time.time() > deadline:
+                raise RemoteNoisyError(
+                    f"remote noisy flush timed out: oldest in-flight "
+                    f"{oldest} < {until_ts}")
+            time.sleep(0.1)
+
     def close(self):
+        self.closed = True
         self._stop.set()
         self._poller.join(timeout=2)

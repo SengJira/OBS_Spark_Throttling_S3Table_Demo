@@ -163,8 +163,20 @@ class LiveChart:
         ax1.set_title(f"TPS per tenant ({BIN_S}s bins)"); ax1.legend(fontsize=9)
         ax2.set_title(f"p95 latency per {BIN_S}s bin (ms)"); ax2.legend(fontsize=9)
         tot = self.lg.totals()
+        remote_txt = ""
+        rn = getattr(self.lg, "remote_noisy", None)
+        if rn is not None:
+            s = rn.stats()
+            if s.get("contact_ok"):
+                remote_txt = "   noisy agent: OK"
+            else:
+                age = s.get("contact_age_s")
+                remote_txt = (f"   noisy agent: LOST CONTACT "
+                              f"{(s.get('last_error') or 'poll failing')[:60]}"
+                              f" ({age if age is not None else '?'}s ago)")
         fig.suptitle(f"throttled (429/SlowDown): {tot['throttled']}   "
-                     f"errors: {tot['errors']}   requests: {tot['events']}",
+                     f"errors: {tot['errors']}   requests: {tot['events']}"
+                     f"{remote_txt}",
                      fontsize=12, fontweight="bold")
         display(fig); plt.close(fig)
 
