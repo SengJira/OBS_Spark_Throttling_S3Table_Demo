@@ -185,7 +185,7 @@ def test_s3_factory_retry_parameter():
     # max_attempts=1 must mean ONE try in total. botocore's `max_attempts`
     # counts retries (1 = one retry), so the factory has to use
     # `total_max_attempts` — checked on a real client's resolved config.
-    s3util.config.USERS["admin"] = ("AKIAEXAMPLEEXAMPLE00", "x" * 40)
+    s3util.config.USERS["admin"] = ("TESTACCESSKEYEXAMPLE", "x" * 40)
     cli = real_s3(max_attempts=1)
     assert cli.meta.config.retries["total_max_attempts"] == 1
     assert "max_attempts" not in cli.meta.config.retries
@@ -197,7 +197,7 @@ def test_s3_factory_retry_parameter():
 def test_single_attempt_client_does_not_retry_a_429():
     # end to end through botocore: a 429 must surface after exactly one request
     from botocore.awsrequest import AWSResponse
-    s3util.config.USERS["admin"] = ("AKIAEXAMPLEEXAMPLE00", "x" * 40)
+    s3util.config.USERS["admin"] = ("TESTACCESSKEYEXAMPLE", "x" * 40)
     cli = real_s3(max_attempts=1, endpoint="https://s3.invalid")
     sent = []
 

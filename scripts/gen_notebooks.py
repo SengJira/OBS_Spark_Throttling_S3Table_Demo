@@ -32,6 +32,8 @@ def notes(txt):
 
 def notebook(cells):
     n = nbformat.v4.new_notebook(cells=cells)
+    for i, cell in enumerate(n.cells):
+        cell.id = str(i)
     n.metadata["kernelspec"] = KERNEL
     n.metadata["language_info"] = {"name": "python", "version": "3.11"}
     return n
