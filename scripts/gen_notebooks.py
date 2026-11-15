@@ -238,7 +238,12 @@ def nb_02():
     "`rules_config_cache_expiration_time` = 300 s (read-only). The notebook "
     "therefore waits `PROPAGATION_S` (default 300 s) after storing the "
     "rules before it measures enforcement. A verdict the evidence cannot "
-    "decide is INCONCLUSIVE — never a pass."),
+    "decide is INCONCLUSIVE — never a pass.\n\n"
+    "**Noisy host:** `NOISY_HOST` empty = noisy PUTs run locally on this "
+    "host; `NOISY_HOST=192.168.1.41:8765` delegates only tenant-noisy "
+    "control/events to `poc/noisy_agent.py` while critical GETs, phases, "
+    "verdicts and the chart stay here. Remote mode refuses to run if the "
+    "two host clocks differ by more than 50 ms."),
  md("## Step 1 — Session, tenant isolation, effective policy\n"
     "Prove noisy/critical are distinct IAM principals, then **read** the "
     "current throttler state. The pre-demo backup must exist before "
@@ -250,7 +255,7 @@ import pandas as pd
 from IPython.display import HTML, display
 from poc import config, results, viz
 from poc import throttle_eval as te
-from poc.loadgen import LoadGen, put_burst
+from poc.loadgen import LoadGen, RemoteNoisy
 from poc.obs_admin import MgmtApi, Throttler
 import poc.spark_helpers as sh
 
@@ -266,7 +271,25 @@ DUR = {"baseline": PHASE_S, "contention": PHASE_S, "simulation": PHASE_S,
 RID = results.run_id()
 
 lg = LoadGen(max_keys=20000)
-iso_rows, iso_ok = lg.verify_tenants()
+remote = None
+if config.NOISY_HOST:
+    if not config.NOISY_AGENT_TOKEN:
+        raise RuntimeError("NOISY_HOST is set but NOISY_AGENT_TOKEN is empty — "
+                           "the remote agent requires the shared X-POC-Token header")
+    remote = RemoteNoisy(lg, config.NOISY_HOST, token=config.NOISY_AGENT_TOKEN,
+                         run_id=RID, max_keys=20000)
+    try:
+        offset, h = remote.check_clock()
+        s3ok = (h.get("s3") or {}).get("ok")
+        if not s3ok:
+            raise RuntimeError("noisy agent cannot reach ObjectScale S3 on 9021: "
+                               f"{(h.get('s3') or {}).get('error')}")
+        iso_rows, iso_ok = remote.verify_tenants()
+    except Exception:
+        remote.close()
+        raise
+else:
+    iso_rows, iso_ok = lg.verify_tenants()
 viz.table(pd.DataFrame(iso_rows))
 thr = Throttler(MgmtApi())
 pol = te.effective_policy(thr)
@@ -281,12 +304,19 @@ if pol["mode"] == "enabled":
     raise RuntimeError("the throttler is already enforcing — this demo must start "
                        "from mode disabled/dry-run (restore the pre-demo state first)")
 print("run id:", RID, "| phase seconds:", DUR, "| PROPAGATION_S:", PROPAGATION_S)
+if remote is not None:
+    print("noisy mode: REMOTE", remote.base_url,
+          f"| U01/U02 clock offset {offset:+.1f} ms | agent S3 ok={s3ok}")
+else:
+    print("noisy mode: LOCAL (NOISY_HOST is empty)")
 viz.banner(iso_ok, "tenant isolation",
            "distinct principals; effective policy read (unchanged)")
 '''),
  notes("Shared namespace bucket, separate principals — that is what "
        "principal-scoped rules discriminate on. LoadGen talks to S3 with "
-       "SDK retries OFF so every 429 is seen as it arrives."),
+       "SDK retries OFF so every 429 is seen as it arrives. In remote mode "
+       "this cell also proves the agent reaches ObjectScale on 9021, writes "
+       "as tenant-noisy, and that U01/U02 clocks agree within 50 ms."),
  md("## Step 2 — Lab rules: schema verification, then store (TC2.2)\n"
     "Two rules for the noisy tenant: all PUTs capped at 50 TPS, and a "
     "tighter 10 TPS cap on one key prefix (`<run_id>/raw/*`). `verify_rule` "
@@ -379,12 +409,14 @@ res = results.write("TC2.3", "contention (throttler disabled)", status=st3, deta
 viz.banner(st3, "TC2.3 contention", why3)
 '''),
  notes("Unrestricted noisy PUTs degrade critical latency — the problem "
-       "statement. Caveat for this lab: both tenants are driven from one "
-       "2-vCPU client host, and a CPU-only disturbance on that host (no S3 "
-       "traffic) degrades the critical GETs just as much — so the size of "
-       "this effect cannot be attributed to ObjectScale alone "
-       "(reports/environment.md, 'Client-side contention'). client_cpu_pct "
-       "is recorded per phase."),
+       "statement. Caveat for this lab: in LOCAL mode both tenants are "
+       "driven from one 2-vCPU client host, and a CPU-only disturbance on "
+       "that host (no S3 traffic) degrades the critical GETs just as much "
+       "— so the size of this effect cannot be attributed to ObjectScale "
+       "alone (reports/environment.md, 'Client-side contention'). "
+       "client_cpu_pct is recorded per phase. With NOISY_HOST set, the "
+       "noisy PUTs run on the second host and this client-side term is "
+       "removed — compare the same phases between the two modes."),
  md("## Step 5 — Phase 3: simulation mode, dry-run (TC2.10)\n"
     "Mode **dry-run** (ObjectScale simulation mode): the server only counts "
     "rule matches. Both workloads continue — the client must see **zero** "
@@ -543,8 +575,8 @@ viz.banner(st5, "TC2.5 recovery",
  py('''
 lg.pause_noisy(); time.sleep(3)
 lg.start_phase("prefix-test"); chart.mark("prefix bursts")
-cov = put_burst("noisy", config.BUCKET_THROTTLE, COVERED, seconds=DUR["burst"], threads=4)
-ctl = put_burst("noisy", config.BUCKET_THROTTLE, CONTROL, seconds=DUR["burst"], threads=4)
+cov = lg.noisy_burst(config.BUCKET_THROTTLE, COVERED, seconds=DUR["burst"], threads=4)
+ctl = lg.noisy_burst(config.BUCKET_THROTTLE, CONTROL, seconds=DUR["burst"], threads=4)
 pfx = te.evaluate_prefix(cov, ctl, PREFIX_LIMIT)
 stored = [r.get("id") for r in thr.get_rules()]
 if PREFIX_RULE["id"] not in stored:
@@ -639,7 +671,9 @@ viz.banner(res["status"], "TC2.11 worker lifecycle",
            else f"restartable={restarted}, lingering={leftover}")
 '''),
  notes("stop() joins every worker; a worker that outlives its join timeout "
-       "is kept in the count instead of being forgotten."),
+       "is kept in the count instead of being forgotten. In remote mode the "
+       "same calls go to the agent on the noisy host and lg.stop() also "
+       "closes the event poller."),
  md("## Step 12 — Verdicts + server-side correlation (TC2.9)\n"
     "Score all phases against the approved thresholds and correlate the "
     "client-side throttle responses with ObjectScale's own counters where "

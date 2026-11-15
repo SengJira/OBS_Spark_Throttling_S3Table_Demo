@@ -8,9 +8,9 @@ standard S3 (S3A), the S3 Throttler (QoS), and native S3 Tables via Apache Icebe
 - `notebooks/` — demo suite (`99_reset`, `00`–`04`). **Generated** by
   `scripts/gen_notebooks.py` and committed without outputs — change the
   generator, never the `.ipynb` files.
-- `poc/` — engine modules (config, obs_admin, s3util, loadgen, throttle_eval,
-  spark_helpers, results, reset, viz, demo_data, throughput). Notebooks are thin
-  wrappers.
+- `poc/` — engine modules (config, obs_admin, s3util, loadgen, noisy_agent,
+  throttle_eval, spark_helpers, results, reset, viz, demo_data, throughput).
+  Notebooks are thin wrappers.
 - `scripts/` — `prep_obs.py` (ObjectScale provisioning + one-time throttler
   backup), `render_conf.py` (cluster-wide `spark-defaults.conf`),
   `build_iceberg.sh` (Iceberg 4.2 runtime from source, ObjectScale-specific
@@ -41,12 +41,41 @@ output-free), the report in `reports/PoC_Report.html`. Or run in JupyterLab:
 | `PROPAGATION_S` | `300` | minimum age of the stored rules before enforcement is measured (ObjectScale rule cache: 300 s) |
 | `THROTTLE_SETTLE_S` | `120` | how long to wait for the mode switch to become visible |
 | `POC_RUN_ID` | `demo-<timestamp>` | one run ID for the whole suite |
+| `NOISY_HOST` | empty | `host:port` of `poc/noisy_agent.py` on the second client host; empty keeps noisy PUTs local on U01 |
+| `NOISY_AGENT_TOKEN` | empty | shared `X-POC-Token` header for U01 ↔ U02 control traffic |
 
 Approximate run time at the defaults (2-vCPU lab host): `99_reset` 1–3 min,
 `00` 0.5 min, `01` ≈ 3 min, `02` ≈ 14 min (60 s baseline + 60 s contention +
 60 s dry-run + ≈ 120 s remaining propagation wait + mode switch + 120 s
 enforced + 60 s recovery + prefix bursts + two Spark writes), `03` ≈ 3 min,
 `04` < 0.5 min — **≈ 25 min in total**.
+
+### Remote noisy agent (optional second client host)
+
+Notebook 02 can move **only** the tenant-noisy PUT workload to a second host
+(U02, `192.168.1.41`) while Jupyter, Spark, critical GETs, phases, verdicts
+and the live chart stay on U01 (`192.168.1.40`). ObjectScale is unchanged.
+
+- U01: set `NOISY_HOST=192.168.1.41:8765` and `NOISY_AGENT_TOKEN=…` in `.env`.
+- U02: install the repo, Python 3.10+ with boto3, the ObjectScale CA bundle,
+  and chrony synced to the same source as U01. The agent env file
+  `/etc/obs-poc/noisy-agent.env` (0600) contains **only** the tenant-noisy
+  keys plus `OBS_S3_ENDPOINT`, `OBS_CA_BUNDLE`, `OBS_REGION`, `OBS_NAMESPACE`,
+  `BUCKET_THROTTLE`, `NOISY_AGENT_TOKEN`, `NOISY_AGENT_BIND=192.168.1.41`,
+  `NOISY_AGENT_PORT=8765`. No admin/root/critical/table credentials.
+- Service: `systemd/noisy-agent.service` → `python3 -m poc.noisy_agent`.
+  It binds only to the U02 address, requires `X-POC-Token`, and stops noisy
+  workers if U01 stops polling for `NOISY_AGENT_IDLE_S` (default 60 s).
+- Firewall: allow TCP 8765 only from `192.168.1.40`.
+- Notebook 02 Step 1 refuses to run if `/health` reports a U01/U02 clock
+  offset over 50 ms, if the agent cannot reach ObjectScale on 9021, or if the
+  remote PUT/GET probe does not run as `tenant-noisy`.
+
+For the customer comparison, run notebook 02 once with `NOISY_HOST` empty
+(local noisy on U01) and once with it set (remote noisy on U02), keeping the
+same phase lengths. Compare `client_cpu_pct`, contention critical p95 and
+recovery critical p95 in `reports/raw/TC2.*.json` — the remote run removes
+the single-host CPU-contention term documented in `reports/environment.md`.
 
 ### Run IDs and the scorecard
 
