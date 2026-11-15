@@ -594,3 +594,109 @@ def test_multipart_sweep_sizes_pool_for_widest_level(monkeypatch):
     assert seen["max_pool_connections"] >= 16
     assert [r["concurrency"] for r in rows] == [1, 4, 16]
     assert len(bodies) == 1, "part buffer must be allocated once, not per level"
+
+
+# ---------- prefix burst + TC2.4/TC2.6 evaluation (#3, #5) ----------
+
+def test_put_burst_reports_ok_tps_and_throttles_per_prefix():
+    orig = FakeS3.put_object
+    def by_prefix(self, Bucket, Key, Body=b"", ContentLength=0, **kw):
+        time.sleep(0.002)
+        if "/raw/" in Key:
+            raise throttle_error(code="TooManyRequests", status=429)
+        return {"ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 0}}
+    FakeS3.put_object = by_prefix
+    try:
+        cov = loadgen.put_burst("noisy", "b", "demo-x/raw", seconds=0.4, threads=2)
+        ctl = loadgen.put_burst("noisy", "b", "demo-x/curated", seconds=0.4, threads=2)
+    finally:
+        FakeS3.put_object = orig
+    assert cov["ok"] == 0 and cov["r429"] == cov["n"] > 0 and cov["ok_tps"] == 0
+    assert ctl["throttled"] == 0 and ctl["ok_tps"] > 10
+    assert all(kw.get("max_attempts") == 1 for u, kw in FakeS3.created)
+
+
+def _burst(ok_tps, throttled=0, n=500):
+    return {"n": n, "ok_tps": ok_tps, "throttled": throttled}
+
+
+@pytest.mark.parametrize("cov,ctl,want", [
+    (_burst(9, 40), _burst(46, 3), "PASS"),           # covered held, control free
+    (_burst(9, 0), _burst(46, 0), "PASS"),            # held by delay only
+    (_burst(45, 0), _burst(46, 0), "INCONCLUSIVE"),   # prefix rule not effective
+    (_burst(9, 40), _burst(10, 40), "INCONCLUSIVE"),  # control limited as well
+    (_burst(9, 40, n=10), _burst(46, 0), "INCONCLUSIVE"),  # too little data
+])
+def test_evaluate_prefix(cov, ctl, want):
+    out = throttle_eval.evaluate_prefix(cov, ctl, limit=10)
+    assert out["status"] == want and out["reason"]
+
+
+def test_tc24_status_pass_requires_signature_and_rate_within_limit():
+    st = _stats(noisy_ok=5400, noisy_thr=350, crit_p95=15, rec_p95=10,
+                base_p95=9, enf_noisy_p95=700)
+    status, reason, active, mode = throttle_eval.tc24_status(st, 50)
+    assert (status, active, mode) == ("PASS", True, "reject+delay"), reason
+
+
+def test_tc24_status_inconclusive_without_any_signature():
+    st = _stats(noisy_ok=30000, noisy_thr=0, crit_p95=20, rec_p95=10, base_p95=9)
+    status, reason, active, _ = throttle_eval.tc24_status(st, 50)
+    assert status == "INCONCLUSIVE" and not active and "no enforcement" in reason
+
+
+def test_tc24_status_fail_when_rejections_do_not_hold_the_limit():
+    st = _stats(noisy_ok=30000, noisy_thr=5, crit_p95=20, rec_p95=10, base_p95=9)
+    status, reason, active, _ = throttle_eval.tc24_status(st, 50)
+    assert status == "FAIL" and active and "exceeds limit" in reason
+
+
+def test_tc24_status_fail_on_insufficient_data_or_dead_load():
+    st = _stats(noisy_ok=10, noisy_thr=5, crit_p95=20, rec_p95=10, base_p95=9)
+    assert throttle_eval.tc24_status(st, 50)[0] == "FAIL"
+    st = _stats(noisy_ok=5400, noisy_thr=350, crit_p95=15, rec_p95=10, base_p95=9)
+    status, reason, _, _ = throttle_eval.tc24_status(st, 50, sustained=False)
+    assert status == "FAIL" and "not sustained" in reason
+
+
+def test_wait_effective_returns_when_throttle_seen_and_none_on_timeout():
+    class LG:
+        def __init__(self, seq): self.seq = list(seq)
+        def snapshot(self, since=None):
+            g = self.seq.pop(0) if len(self.seq) > 1 else self.seq[0]
+            return {"tenant-noisy": {"PUT": g}}
+    free = {"n": 3000, "ok": 3000, "throttled": 0}
+    hit = {"n": 500, "ok": 460, "throttled": 40}
+    assert throttle_eval.wait_effective(
+        LG([free, free, hit]), 50, timeout_s=60, sleep=lambda s: None) is not None
+    assert throttle_eval.wait_effective(
+        LG([free]), 50, timeout_s=0, sleep=lambda s: None) is None
+
+
+def test_combine_takes_the_worst_status():
+    v = [{"name": "a", "verdict": "PASS"}, {"name": "b", "verdict": "INCONCLUSIVE"},
+         {"name": "c", "verdict": "FAIL"}]
+    assert throttle_eval.combine(v) == "FAIL"
+    assert throttle_eval.combine(v, {"a", "b"}) == "INCONCLUSIVE"
+    assert throttle_eval.combine(v, {"a"}) == "PASS"
+    assert throttle_eval.combine(v, {"zzz"}) == "INCONCLUSIVE"
+
+
+# ---------- TC3.7 denial classification (#7) ----------
+
+@pytest.mark.parametrize("text,denied", [
+    ("Job aborted\nCaused by: software.amazon.awssdk.services.s3.model."
+     "AccessDeniedException: Access Denied (Service: S3, Status Code: 403, "
+     "Request ID: abc:1)", True),
+    (": org.apache.iceberg.exceptions.ForbiddenException: Forbidden: Not "
+     "authorized to make this request", True),
+    ("[INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS] Cannot write to "
+     "`os`.`pocns`.`orders_ice`", False),
+    ("java.net.ConnectException: Connection refused", False),
+])
+def test_access_denied_reason_only_matches_permission_failures(text, denied):
+    from poc import spark_helpers
+    reason = spark_helpers.access_denied_reason(Exception(text))
+    assert bool(reason) is denied
+    if reason:
+        assert "Request ID" not in reason

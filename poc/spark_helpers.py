@@ -237,6 +237,25 @@ def versions(spark):
     }
 
 
+ACCESS_DENIED_RE = (r"AccessDenied|Access Denied|Status Code: 403|\b403\b|"
+                    r"ForbiddenException|Forbidden|Not authorized")
+
+
+def access_denied_reason(error):
+    """The line of an exception text that shows an access denial (S3 403
+    AccessDenied on the data plane, or Iceberg REST ForbiddenException on the
+    control plane) — or None when the failure is something else, e.g. a
+    schema/analysis error that never reached authorization."""
+    import re
+    text = str(error)
+    for line in text.splitlines():
+        if re.search(ACCESS_DENIED_RE, line):
+            line = re.sub(r"\s+", " ", line).strip(" :")
+            return re.sub(r"(Request ID|Extended Request ID): [^,)]+[,)]?\s*",
+                          "", line)[:240]
+    return None
+
+
 def s3a_committer_stats(bucket, prefix, user="admin"):
     """IOStatistics the S3A committer aggregated from every task into the
     job's _SUCCESS file (non-Parquet writes). Returns the counters relevant to

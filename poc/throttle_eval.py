@@ -6,9 +6,9 @@ plus the live /throttle/config/actions list — nothing undocumented is sent.
 
 evaluate() turns per-phase LoadGen metrics into PASS/FAIL/INCONCLUSIVE
 verdicts against customer-approved thresholds. INCONCLUSIVE is used when the
-data cannot decide — e.g. this lab build accepts rules but emits no 429/503
-until a datahead reload (see reports/environment.md), so an enforcement
-verdict cannot be claimed either way.
+data cannot decide — e.g. no enforcement signature was observed, so an
+enforcement verdict cannot be claimed either way. It is never counted as a
+pass.
 """
 import time
 
@@ -175,36 +175,156 @@ def server_counters(thr):
     return {"available": bool(data), "probed": probed, "data": data}
 
 
-def detect(phase_stats, limit, th=None, critical_group="tenant-critical GET",
-           noisy_group="tenant-noisy PUT"):
-    """Decide whether enforcement fired in the 'enforced' phase, and how.
+def signals(phase_stats, limit, th=None, noisy_group="tenant-noisy PUT"):
+    """Raw enforcement evidence from the 'enforced' phase (client retries are
+    off in LoadGen, so every server response is counted as it arrived).
 
-    Returns (active: bool, mode: 'reject'|'delay'|'none').
-    ObjectScale can throttle by rejection (429/SlowDown) OR by delay —
-    requests all return 200 but are queued server-side to the policy rate.
-    Delay-mode signature: ok_tps collapses into the ~limit band while
-    contention was well above it AND noisy tail latency spikes (a dead load
-    generator cannot produce that signature)."""
+    rejected: 429 / 503-SlowDown responses were returned.
+    delayed:  accepted TPS sits in the limit band while the unthrottled rate
+              was at least twice the limit AND accepted-request tail latency
+              rose — the server queues requests to hold the rate."""
     th = th or DEFAULT_THRESHOLDS
     ps = phase_stats
-    cont_noisy = ps.get("contention", {}).get(noisy_group, {})
+    cont = ps.get("contention", {})
+    cont_noisy = cont.get(noisy_group, {})
     enfc = ps.get("enforced", {})
     enfc_noisy = enfc.get(noisy_group, {})
-    span = enfc.get("_window", {}).get("seconds", 1)
-    ok_tps = enfc_noisy.get("ok", 0) / max(1e-9, span)
-    before = cont_noisy.get("ok", 0) / max(
-        1e-9, ps.get("contention", {}).get("_window", {}).get("seconds", 1))
-    if enfc_noisy.get("throttled", 0) > 0:
-        return True, "reject"
-    delay = (
+    ok_tps = enfc_noisy.get("ok", 0) / max(1e-9, enfc.get("_window", {}).get("seconds", 1))
+    before = cont_noisy.get("ok", 0) / max(1e-9, cont.get("_window", {}).get("seconds", 1))
+    tail = max(enfc_noisy.get("ok_p95", enfc_noisy.get("p95", 0)),
+               enfc_noisy.get("ok_p99", enfc_noisy.get("p99", 0)))
+    base_tail = cont_noisy.get("ok_p95", cont_noisy.get("p95", 0))
+    delayed = (
         bool(limit)
         and enfc_noisy.get("n", 0) >= th["min_requests"]
         and ok_tps <= limit * th["noisy_tps_limit_factor"]
         and ok_tps >= limit * 0.2            # pinned near limit, not dead
         and before >= limit * 2
-        and max(enfc_noisy.get("p95", 0), enfc_noisy.get("p99", 0))
-            >= max(2 * cont_noisy.get("p95", 0), 25))
-    return (True, "delay") if delay else (False, "none")
+        and tail >= max(2 * base_tail, 25))
+    return {"rejected": enfc_noisy.get("throttled", 0) > 0, "delayed": delayed,
+            "throttled": enfc_noisy.get("throttled", 0),
+            "ok_tps": ok_tps, "ok_tps_before": before,
+            "within_limit": bool(limit) and ok_tps <= limit * th["noisy_tps_limit_factor"]}
+
+
+def detect(phase_stats, limit, th=None, critical_group="tenant-critical GET",
+           noisy_group="tenant-noisy PUT"):
+    """Decide whether enforcement fired in the 'enforced' phase, and how.
+
+    Returns (active: bool, mode: 'reject+delay'|'reject'|'delay'|'none').
+    Observed on ObjectScale 4.4 with client retries off (reports/
+    environment.md): the throttler does both — it queues requests to hold
+    the accepted rate at the limit (accepted p95 ~25 ms -> ~700 ms) and
+    rejects the overflow with HTTP 429 `TooManyRequests` (~6 % of requests).
+    With SDK retries on, those 429s are retried away and only the delay is
+    visible, which is why LoadGen disables retries."""
+    sig = signals(phase_stats, limit, th, noisy_group)
+    if sig["rejected"] and sig["delayed"]:
+        return True, "reject+delay"
+    if sig["rejected"]:
+        return True, "reject"
+    if sig["delayed"]:
+        return True, "delay"
+    return False, "none"
+
+
+def tc24_status(phase_stats, limit, sustained=True, th=None,
+                critical_group="tenant-critical GET",
+                noisy_group="tenant-noisy PUT"):
+    """Status of the enforcement test case — never a hard-coded PASS.
+
+    FAIL          not enough data, the noisy load died, or throttle responses
+                  were seen but the accepted rate still exceeds the limit.
+    INCONCLUSIVE  enough data but no enforcement signature at all.
+    PASS          enforcement signature AND accepted noisy TPS within the
+                  limit tolerance.
+    Returns (status, reason, active, mode)."""
+    th = th or DEFAULT_THRESHOLDS
+    enfc = phase_stats.get("enforced", {})
+    n_noisy = enfc.get(noisy_group, {}).get("n", 0)
+    n_crit = enfc.get(critical_group, {}).get("n", 0)
+    active, mode = detect(phase_stats, limit, th, critical_group, noisy_group)
+    sig = signals(phase_stats, limit, th, noisy_group)
+    if n_noisy < th["min_requests"] or n_crit < th["min_requests"]:
+        return ("FAIL", f"insufficient data in the enforced phase "
+                        f"(noisy {n_noisy}, critical {n_crit} requests)",
+                active, mode)
+    if not sustained:
+        return "FAIL", "noisy load was not sustained through the phase", active, mode
+    if not active:
+        return ("INCONCLUSIVE",
+                f"no enforcement signature: 0 throttle responses and accepted "
+                f"rate {sig['ok_tps']:.1f} TPS vs limit {limit} "
+                f"(unthrottled {sig['ok_tps_before']:.1f})", active, mode)
+    if not sig["within_limit"]:
+        return ("FAIL", f"{sig['throttled']} throttle responses, but accepted "
+                        f"rate {sig['ok_tps']:.1f} TPS exceeds limit {limit} "
+                        f"x{th['noisy_tps_limit_factor']}", active, mode)
+    return ("PASS", f"{mode}: accepted {sig['ok_tps']:.1f} TPS vs limit "
+                    f"{limit} (unthrottled {sig['ok_tps_before']:.1f}), "
+                    f"{sig['throttled']} throttle responses", active, mode)
+
+
+def wait_effective(lg, limit, timeout_s=120, window_s=10, poll_s=5, th=None,
+                   tenant="tenant-noisy", op="PUT", on_tick=None, sleep=None):
+    """After a mode switch, wait until enforcement is visible in the last
+    `window_s` seconds (a throttle response, or accepted TPS inside the limit
+    band). Returns seconds waited, or None if `timeout_s` elapsed first —
+    the caller then measures anyway and the verdict reflects it."""
+    th = th or DEFAULT_THRESHOLDS
+    sleep = sleep or time.sleep
+    t0 = time.time()
+    while True:
+        waited = time.time() - t0
+        g = lg.snapshot(since=time.time() - window_s).get(tenant, {}).get(op, {})
+        ok_tps = g.get("ok", 0) / window_s
+        if g.get("n", 0) and (g.get("throttled", 0) > 0 or (
+                waited >= window_s
+                and ok_tps <= limit * th["noisy_tps_limit_factor"])):
+            return round(waited, 1)
+        if waited >= timeout_s:
+            return None
+        if on_tick:
+            on_tick(waited, ok_tps, g.get("throttled", 0))
+        sleep(poll_s)
+
+
+def evaluate_prefix(covered, control, limit, th=None):
+    """Prefix-scoped rule check from two PUT bursts by the same principal:
+    one under the covered key prefix, one under a control prefix.
+
+    PASS only if the covered prefix is held at its limit while the control
+    prefix runs clearly above it. Anything else is INCONCLUSIVE with the
+    reason (the rule may not have propagated, or the offered load was too
+    low to tell the two apart)."""
+    th = th or DEFAULT_THRESHOLDS
+    cov_tps, ctl_tps = covered.get("ok_tps", 0), control.get("ok_tps", 0)
+    band = limit * th["noisy_tps_limit_factor"]
+    detail = (f"covered {cov_tps:.1f} ok TPS / {covered.get('throttled', 0)} "
+              f"throttle responses, control {ctl_tps:.1f} ok TPS / "
+              f"{control.get('throttled', 0)}, prefix limit {limit}")
+    if min(covered.get("n", 0), control.get("n", 0)) < th["min_requests"]:
+        return {"status": "INCONCLUSIVE", "reason": "too few requests — " + detail}
+    cov_enforced = cov_tps <= band and (
+        covered.get("throttled", 0) > 0 or ctl_tps >= 2 * band)
+    ctl_free = ctl_tps >= max(2 * cov_tps, limit * 1.5)
+    if cov_enforced and ctl_free:
+        return {"status": "PASS", "reason": detail}
+    if not cov_enforced:
+        why = "covered prefix is not held at the prefix limit"
+    else:
+        why = "control prefix is not clearly above the prefix limit"
+    return {"status": "INCONCLUSIVE", "reason": f"{why} — {detail}"}
+
+
+def combine(verdicts, names=None):
+    """Worst status of the named verdicts: FAIL > INCONCLUSIVE > PASS."""
+    sts = [v["verdict"] for v in verdicts if names is None or v["name"] in names]
+    if not sts:
+        return "INCONCLUSIVE"
+    if "FAIL" in sts:
+        return "FAIL"
+    return "INCONCLUSIVE" if "INCONCLUSIVE" in sts else "PASS"
 
 
 def _verdict(name, ok, detail, data_ok=True):

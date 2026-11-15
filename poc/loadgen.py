@@ -453,3 +453,47 @@ class LoadGen:
         distinct = len({config.USERS["noisy"][0],
                         config.USERS["critical"][0]}) == 2
         return rows, distinct
+
+
+def put_burst(user, bucket, prefix, seconds=20, threads=4, size=1024,
+              keys_per_thread=50):
+    """Short PUT burst by one PoC user under one key prefix, client retries
+    off. Used to compare a rule-covered prefix with a control prefix.
+    Returns the same aggregate as phase_stats() plus ok_tps / seconds."""
+    events, lock, stop = [], threading.Lock(), threading.Event()
+    body = b"x" * size
+    prefix = prefix.rstrip("/") + "/"
+
+    def worker(wid):
+        cli = s3util.s3(user, max_attempts=1)
+        i = 0
+        while not stop.is_set():
+            i += 1
+            ts, t0 = time.time(), time.monotonic()
+            try:
+                r = cli.put_object(Bucket=bucket, Body=body,
+                                   Key=f"{prefix}k{wid}-{i % keys_per_thread}.bin")
+                ev = (ts, (time.monotonic() - t0) * 1000, STATUS_OK, "",
+                      _ok_retries(r))
+            except Exception as e:
+                ev = (ts, (time.monotonic() - t0) * 1000, _status(e), _code(e),
+                      _retries(e))
+                time.sleep(0.05)
+            with lock:
+                events.append(ev)
+
+    ths = [threading.Thread(target=worker, args=(w,), daemon=True)
+           for w in range(threads)]
+    t0 = time.monotonic()
+    for t in ths:
+        t.start()
+    stop.wait(seconds)
+    stop.set()
+    for t in ths:
+        t.join(timeout=15)
+    span = time.monotonic() - t0
+    with lock:
+        agg = LoadGen._agg(list(events), span)
+    agg.update(seconds=round(span, 1), ok_tps=agg["ok"] / max(1e-9, span),
+               prefix=prefix, user=user)
+    return agg
