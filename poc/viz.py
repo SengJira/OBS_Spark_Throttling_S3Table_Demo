@@ -2,14 +2,31 @@
 from IPython.display import HTML, display, clear_output
 import pandas as pd
 
+from . import results
 
-def banner(passed, title, msg=""):
-    color = "#1e7d32" if passed else "#b71c1c"
-    label = "PASS" if passed else "FAIL"
+
+def banner(status, title, msg=""):
+    """Status banner. `status` is PASS | FAIL | INCONCLUSIVE | INCOMPLETE, or
+    a bool (True -> PASS, False -> FAIL). Amber = INCONCLUSIVE: the evidence
+    does not decide, which is never shown as a pass."""
+    label = status_label(status)
+    color = results.STATUS_COLORS.get(label, results.STATUS_COLORS["FAIL"])
     display(HTML(
         f'<div style="background:{color};color:#fff;padding:10px 16px;border-radius:6px;'
         f'font-size:17px;font-family:sans-serif;margin:8px 0">'
         f'<b>{label}</b> — {title} <span style="opacity:.85">{msg}</span></div>'))
+
+
+def status_label(status):
+    if isinstance(status, str):
+        return status.upper()
+    return "PASS" if status else "FAIL"
+
+
+def status_style(row, column="status"):
+    """pandas Styler row function colouring a row by its status column."""
+    color = results.STATUS_COLORS.get(str(row[column]).upper(), "#b71c1c")
+    return [f"background-color:{color};color:#fff"] * len(row)
 
 
 def table(df, caption=None):
