@@ -856,20 +856,28 @@ class RemoteNoisy:
     def health(self, timeout=10):
         return self._request("GET", "/health", timeout=timeout)
 
-    def measure_clock(self, timeout=10):
+    def measure_clock(self, timeout=10, samples=3):
         """Round-trip clock measurement: offset = agent_time - midpoint of
-        the client send/receive wall times, keeping the RTT."""
-        t_send = time.time()
-        h = self._request("GET", "/health", timeout=timeout, ts=t_send)
-        t_recv = time.time()
-        agent_time = h.get("agent_time")
-        if agent_time is None:
-            return {"offset_ms": None, "rtt_ms": (t_recv - t_send) * 1000,
-                    "health": h}
-        mid = (t_send + t_recv) / 2.0
-        return {"offset_ms": (agent_time - mid) * 1000,
-                "rtt_ms": (t_recv - t_send) * 1000,
-                "agent_time": agent_time, "health": h}
+        the client send/receive wall times, keeping the RTT. The first
+        request after an idle period can have a large, asymmetric RTT that
+        dominates the midpoint estimate, so take the lowest-RTT sample."""
+        best = None
+        for _ in range(max(1, samples)):
+            t_send = time.time()
+            h = self._request("GET", "/health", timeout=timeout, ts=t_send)
+            t_recv = time.time()
+            agent_time = h.get("agent_time")
+            if agent_time is None:
+                m = {"offset_ms": None, "rtt_ms": (t_recv - t_send) * 1000,
+                     "health": h}
+            else:
+                mid = (t_send + t_recv) / 2.0
+                m = {"offset_ms": (agent_time - mid) * 1000,
+                     "rtt_ms": (t_recv - t_send) * 1000,
+                     "agent_time": agent_time, "health": h}
+            if best is None or m["rtt_ms"] < best["rtt_ms"]:
+                best = m
+        return best
 
     def check_clock(self, limit_ms=50.0, timeout=10):
         """Return (offset_ms, health) or raise when the U01/U02 clocks are
