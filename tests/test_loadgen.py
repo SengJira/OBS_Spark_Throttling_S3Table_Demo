@@ -571,3 +571,26 @@ def test_evaluate_no_delay_when_latency_flat():
 def test_server_counters_reports_unavailable():
     srv = throttle_eval.server_counters(FakeThr())
     assert srv["available"] is False and "data" in srv
+
+
+# ---------- throughput sweep (#8) ----------
+
+def test_multipart_sweep_sizes_pool_for_widest_level(monkeypatch):
+    from poc import throughput
+    seen, bodies = {}, set()
+
+    class Cli:
+        def create_multipart_upload(self, **kw): return {"UploadId": "u"}
+        def upload_part(self, Body, **kw):
+            bodies.add(id(Body)); return {"ETag": "e"}
+        def complete_multipart_upload(self, **kw): return {}
+        def abort_multipart_upload(self, **kw): return {}
+
+    def factory(user="admin", **kw):
+        seen.update(kw); return Cli()
+    monkeypatch.setattr(s3util, "s3", factory)
+    rows = throughput.multipart_sweep("b", "p", levels=(1, 4, 16),
+                                      total_mb=2, part_mb=1)
+    assert seen["max_pool_connections"] >= 16
+    assert [r["concurrency"] for r in rows] == [1, 4, 16]
+    assert len(bodies) == 1, "part buffer must be allocated once, not per level"

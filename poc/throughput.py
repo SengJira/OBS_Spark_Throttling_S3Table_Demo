@@ -19,20 +19,22 @@ def multipart_sweep(bucket, prefix, levels=(1, 2, 4, 8, 16),
                     total_mb=256, part_mb=16, user="admin"):
     """One multipart upload per level. Returns [{'concurrency', 'mb',
     'seconds', 'mbs'}]. Aborts cleanly on failure."""
-    cli = s3util.s3(user)
-    part = os.urandom(part_mb * 1024 * 1024)
+    # one client shared by all part threads: size its connection pool for
+    # the widest level, or the sweep measures botocore's 10-connection pool
+    cli = s3util.s3(user, max_pool_connections=max(levels) + 2)
+    part = os.urandom(part_mb * 1024 * 1024)   # one buffer, reused by every level
     n_parts = max(1, total_mb // part_mb)
     rows = []
     for n in levels:
         key = f"{prefix}/sweep-{n}way.bin"
         mup = cli.create_multipart_upload(Bucket=bucket, Key=key)
         try:
-            t0 = time.time()
+            t0 = time.monotonic()
             with ThreadPoolExecutor(max_workers=n) as ex:
                 parts = list(ex.map(
                     lambda i: _put_part(cli, bucket, key, mup["UploadId"], i + 1, part),
                     range(n_parts)))
-            dt = time.time() - t0
+            dt = time.monotonic() - t0
             cli.complete_multipart_upload(
                 Bucket=bucket, Key=key, UploadId=mup["UploadId"],
                 MultipartUpload={"Parts": sorted(parts, key=lambda p: p["PartNumber"])})
