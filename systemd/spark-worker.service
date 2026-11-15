@@ -1,0 +1,18 @@
+[Unit]
+Description=Apache Spark Worker (4.2 PoC)
+After=spark-master.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spark
+Group=spark
+Environment=SPARK_HOME=/opt/spark
+EnvironmentFile=-/root/OBS/.env
+ExecStart=/opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://192.168.1.40:7077
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=JupyterLab (ObjectScale PoC)
+After=network-online.target spark-master.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/OBS
+Environment=SPARK_HOME=/opt/spark
+Environment=PYSPARK_PYTHON=/opt/jupyter/venv/bin/python
+Environment=PYSPARK_DRIVER_PYTHON=/opt/jupyter/venv/bin/python
+EnvironmentFile=-/root/OBS/.env
+Environment=JUPYTER_CONFIG_DIR=/opt/jupyter/jupyter_lab_config
+Environment=JUPYTER_DATA_DIR=/opt/jupyter/kernels
+ExecStart=/opt/jupyter/venv/bin/jupyter lab --no-browser --allow-root -y
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

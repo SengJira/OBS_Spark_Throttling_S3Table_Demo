@@ -1,0 +1,7 @@
+.env
+.ipynb_checkpoints/
+__pycache__/
+reports/raw/*.json
+reports/demo_backup/
+reports/PoC_Report.html
+notebooks/.ipynb_checkpoints/

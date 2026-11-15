@@ -1,0 +1,10 @@
+{
+  "config": {
+    "throttle": {
+      "rules": []
+    }
+  },
+  "mode": "disabled",
+  "response_code": 503,
+  "_note": "Pre-PoC baseline captured during Phase 0 discovery: the throttler had no rules configured, mode was Disabled, response_code was at default 503 (values verified live; the JSON rule config was 404/empty)."
+}

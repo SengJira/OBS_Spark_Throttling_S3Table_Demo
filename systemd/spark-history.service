@@ -1,0 +1,17 @@
+[Unit]
+Description=Apache Spark History Server (4.2 PoC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spark
+Group=spark
+Environment=SPARK_HOME=/opt/spark
+EnvironmentFile=-/root/OBS/.env
+ExecStart=/opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
