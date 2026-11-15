@@ -938,14 +938,19 @@ viz.banner(verdicts["overall"], "TC2.9 overall verdict",
     "Every phase side by side: request counts, TPS, latencies, throttle "
     "responses, errors, paced slots and client CPU."),
  py('''
-summary = [{"phase": ph, "client_cpu_pct": gs["_window"]["client_cpu_pct"],
-            "workload": k, "n": v["n"], "tps": round(v["tps"], 1),
-            "ok_p50": round(v["ok_p50"]), "ok_p95": round(v["ok_p95"]),
-            "ok_p99": round(v["ok_p99"]), "throttled": v["throttled"],
-            "r429": v["r429"], "errors": v["errors"], "boundary": v["boundary"],
+def _win(gs):
+    w = gs.get("_window")
+    return w if isinstance(w, dict) else {}
+summary = [{"phase": ph, "client_cpu_pct": _win(gs).get("client_cpu_pct"),
+            "workload": k, "n": v.get("n"), "tps": round(v.get("tps", 0), 1),
+            "ok_p50": round(v.get("ok_p50", 0)), "ok_p95": round(v.get("ok_p95", 0)),
+            "ok_p99": round(v.get("ok_p99", 0)), "throttled": v.get("throttled", 0),
+            "r429": v.get("r429", 0), "errors": v.get("errors", 0),
+            "boundary": v.get("boundary", 0),
             "paced": gs.get("tenant-critical GET_paced"),
             "missed": gs.get("tenant-critical GET_missed")}
-           for ph, gs in ps_all.items() for k, v in gs.items() if k != "_window"]
+           for ph, gs in ps_all.items() for k, v in gs.items()
+           if k != "_window" and isinstance(v, dict) and "n" in v]
 viz.table(pd.DataFrame(summary))
 chart.refresh(out, seconds=2)
 '''),
