@@ -153,9 +153,7 @@ def main():
     api = MgmtApi()
     api.login()
     print("mgmt login ok; version check:")
-    v = api.get("/vdc/nodes").text
-    m = re.search(r"<version>([^<]+)</version>", v)
-    print("  ObjectScale:", m.group(1) if m else "?")
+    print("  ObjectScale:", api.version() or "?")
 
     print("== namespace ==")
     ensure_namespace(api)

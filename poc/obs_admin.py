@@ -4,14 +4,13 @@ Token auth: GET /login (basic root) -> X-SDS-AUTH-TOKEN.
 The 4443 cert has SAN=localhost only, so hostname checking is disabled for this
 endpoint ONLY — the certificate chain itself is still verified against the
 imported OBS CA (no blanket verify=False)."""
-import requests, urllib3, threading
+import json, pathlib, re, threading
+import xml.etree.ElementTree as ET
+
+import requests
 from requests.adapters import HTTPAdapter
 
 from . import config
-
-# hostname verification disabled only on the session used for 4443;
-# chain verification stays enabled (adapter still uses cert chain via CA bundle).
-_urllib3_warnings_done = False
 
 
 class _PinNoHostnameAdapter(HTTPAdapter):
@@ -80,10 +79,18 @@ class MgmtApi:
                      headers={"x-emc-namespace": namespace or config.OBS_NAMESPACE})
         return r
 
+    def version(self):
+        """ObjectScale version string from GET /vdc/nodes, or None."""
+        r = self.get("/vdc/nodes")
+        if r.status_code != 200:
+            return None
+        m = re.search(r"<version>([^<]+)</version>", r.text) or re.search(
+            r'"version"\s*:\s*"([^"]+)"', r.text)
+        return m.group(1) if m else None
+
     # ---------------- CMF config ----------------
     def get_config(self, name):
         """Read a CMF config param; returns configured or default value."""
-        import xml.etree.ElementTree as ET
         r = self.get(f"/config/{name}")
         if r.status_code != 200:
             return None

@@ -119,20 +119,33 @@ def build_session(app="obs-poc", tables_user="tables-rw"):
     return b.getOrCreate()
 
 
+def iceberg_version(spark):
+    """Iceberg version of the runtime actually loaded in the driver JVM."""
+    try:
+        return str(spark._jvm.org.apache.iceberg.IcebergBuild.version())
+    except Exception:
+        import glob, re
+        for jar in glob.glob(f"{config.SPARK_JARS}/iceberg-spark-runtime-*.jar"):
+            m = re.search(r"-(\d+\.\d+\.\d+[^/]*)\.jar$", jar)
+            if m:
+                return m.group(1) + " (from jar name)"
+        return "unknown"
+
+
 def versions(spark):
     hadoop = spark._jvm.org.apache.hadoop.util.VersionInfo.getVersion()
     java = spark._jvm.java.lang.System.getProperty("java.version")
-    obs_ver = "-"
     try:
         from .obs_admin import MgmtApi
-        obs_ver = MgmtApi().version()
-    except Exception:
-        pass
+        obs_ver = MgmtApi().version() or "unknown"
+    except Exception as e:
+        obs_ver = f"unavailable ({type(e).__name__})"
     return {
-        "Spark": spark.version, "Hadoop": hadoop, "Iceberg": "1.12.0",
+        "Spark": spark.version, "Hadoop": hadoop,
+        "Iceberg": iceberg_version(spark),
         "Java": java, "ObjectScale": obs_ver,
         "Master": config.SPARK_MASTER,
-        "Spark UI": "http://192.168.1.40:8080",
+        "Spark UI": config.SPARK_UI,
     }
 
 
