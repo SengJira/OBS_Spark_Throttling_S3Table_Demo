@@ -101,8 +101,19 @@ NOISY_AGENT_TOKEN = get("NOISY_AGENT_TOKEN", "")
 NOISY_AGENT_BIND = get("NOISY_AGENT_BIND", "")
 NOISY_AGENT_PORT = int(get("NOISY_AGENT_PORT", "8765") or 8765)
 NOISY_AGENT_IDLE_S = float(get("NOISY_AGENT_IDLE_S", "60") or 60)
-# Open-loop critical GET rate for notebook 02 (req/s); 0 = as fast as possible
-CRITICAL_RATE = float(get("CRITICAL_RATE", "100") or 100)
+# Open-loop critical GET rate for notebook 02 (req/s); 0 = as fast as
+# possible (the validated default — pacing is experimental and needs enough
+# threads for the rate)
+CRITICAL_RATE = float(get("CRITICAL_RATE", "0") or 0)
+
+# Optional load shaping for notebook 02 (all default to prior behaviour)
+NOISY_THREADS = int(get("NOISY_THREADS", "6") or 6)
+NOISY_OBJECT_KB = int(get("NOISY_OBJECT_KB", "64") or 64)
+PAYLOAD_RANDOM = int(get("PAYLOAD_RANDOM", "0") or 0)
+CRITICAL_OBJECTS = int(get("CRITICAL_OBJECTS", "1") or 1)
+CRITICAL_OBJECT_KB = int(get("CRITICAL_OBJECT_KB", "64") or 64)
+SPARK_WRITE_ROWS = int(get("SPARK_WRITE_ROWS", "200000") or 200000)
+SPARK_WRITE_PARTITIONS = int(get("SPARK_WRITE_PARTITIONS", "20") or 20)
 
 USERS = {
     "admin":  (get("POC_ADMIN_AK"),  get("POC_ADMIN_SK")),

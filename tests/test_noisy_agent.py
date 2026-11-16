@@ -222,3 +222,28 @@ def test_remote_settle_no_missing_events(agent, monkeypatch):
     finally:
         remote.close()
         lg.stop()
+
+
+def test_event_log_bounded_and_reports_drops():
+    """V4-6: event_log keeps only recent events; drops are counted and the
+    oldest retained seq is reported so U01 can detect a gap."""
+    import types
+    st = noisy_agent.AgentState(token="t", idle_s=3600)
+    st.MAX_EVENTS = 5
+    for i in range(8):
+        st._on_event(types.SimpleNamespace(
+            ts=time.time(), tenant="tenant-noisy", op="PUT", lat_ms=1.0,
+            status="ok", code=None, retries=0, phase=None))
+    evs, cur, first, dropped = st.events_since(0)
+    assert cur == 8 and dropped == 3 and first == 4
+    assert [e["seq"] for e in evs] == [4, 5, 6, 7, 8]
+
+
+def test_key_gen_increments_per_run_id():
+    """V4-8: each generator start for the same run gets a new generation so
+    keys never collide after an agent-side restart."""
+    st = noisy_agent.AgentState(token="t", idle_s=3600)
+    assert st._next_key_gen("r1") == 1
+    assert st._next_key_gen("r1") == 2
+    assert st._next_key_gen("r2") == 1
+    assert st._next_key_gen("r1") == 3

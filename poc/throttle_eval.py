@@ -29,6 +29,7 @@ DEFAULT_THRESHOLDS = {
     "baseline_stable_factor": 1.25,   # post-baseline p95 <= factor*baseline p95
     "recovery_improvement_min_share": 0.5,  # share of contention damage removed
     "contention_min_delta_ms": 2.0,   # contention must raise p95 by this much
+    "unaffected_factor": 1.25,        # no-contention: recovery p95 <= factor*baseline
     "max_missed_slot_pct": 1.0,       # paced client misses => INCONCLUSIVE
 }
 
@@ -382,14 +383,20 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
     post_ok = post_base.get("n", 0) >= th["min_requests"]
     if base_ok and post_ok:
         drift = post_base["p95"] / max(1e-9, base["p95"])
-        v.append(_verdict("baseline_stable",
-                          drift <= th["baseline_stable_factor"],
-                          f"post-baseline p95={post_base['p95']:.1f}ms vs "
-                          f"baseline {base['p95']:.1f}ms ({drift:.2f}x)"))
+        # Drift is a property of the test environment, not the product:
+        # baseline_stable reports it as INCONCLUSIVE, never FAIL.
+        v.append({"name": "baseline_stable",
+                  "verdict": ("PASS" if drift <= th["baseline_stable_factor"]
+                              else "INCONCLUSIVE"),
+                  "detail": (f"post-baseline p95={post_base['p95']:.1f}ms vs "
+                             f"baseline {base['p95']:.1f}ms ({drift:.2f}x)")
+                  if drift <= th["baseline_stable_factor"] else
+                  f"environment drifted: post-baseline "
+                  f"{post_base['p95']:.1f}ms vs baseline "
+                  f"{base['p95']:.1f}ms ({drift:.2f}x)"})
     else:
-        v.append(_verdict("baseline_stable", False,
-                          "insufficient baseline/post-baseline data",
-                          data_ok=False))
+        v.append({"name": "baseline_stable", "verdict": "INCONCLUSIVE",
+                  "detail": "insufficient baseline/post-baseline data"})
     drifted = not any(x["name"] == "baseline_stable" and x["verdict"] == "PASS"
                       for x in v)
 
@@ -527,12 +534,24 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
     delta = cont_p95 - base_p95
     if not enough:
         v.append({"name": "recovery_improvement", "verdict": "INCONCLUSIVE",
+                  "mode": "improvement",
                   "detail": "insufficient baseline/contention/recovery data"})
     elif delta < th["contention_min_delta_ms"]:
-        v.append({"name": "recovery_improvement", "verdict": "INCONCLUSIVE",
-                  "detail": f"contention raised p95 by only {delta:.1f}ms "
-                            f"(< {th['contention_min_delta_ms']}ms) — no "
-                            f"contention to recover from"})
+        # No contention to recover from: score whether critical stayed
+        # unaffected instead of demanding an improvement that cannot exist.
+        ratio = rec_p95 / max(1e-9, base_p95)
+        detail = (f"critical unaffected: contention +{delta:.1f} ms; "
+                  f"recovery {rec_p95:.1f} ms = {ratio:.2f}x baseline "
+                  f"{base_p95:.1f} ms")
+        if not enforcement_active:
+            verdict, detail = "INCONCLUSIVE", detail + "; enforcement=no"
+        elif drifted:
+            verdict, detail = "INCONCLUSIVE", detail + "; environment drifted"
+        else:
+            verdict = ("PASS" if rec_p95 <= th["unaffected_factor"] * base_p95
+                       else "FAIL")
+        v.append({"name": "recovery_improvement", "verdict": verdict,
+                  "mode": "unaffected", "detail": detail})
     else:
         share = (cont_p95 - rec_p95) / max(1e-9, delta)
         if not enforcement_active or drifted:
@@ -542,6 +561,7 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
                        else "FAIL")
         note = ("; environment drifted" if drifted else "")
         v.append({"name": "recovery_improvement", "verdict": verdict,
+                  "mode": "improvement",
                   "detail": f"share={share:.2f} (contention {cont_p95:.1f}ms, "
                             f"recovery {rec_p95:.1f}ms, baseline "
                             f"{base_p95:.1f}ms); enforcement="

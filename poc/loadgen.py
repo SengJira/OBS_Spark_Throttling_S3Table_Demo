@@ -16,7 +16,7 @@ This module never touches throttle configuration — rule changes belong to
 the approved lab workflow (notebook 02 / scripts/prep_obs.py backup+restore).
 """
 import threading, time, collections, statistics, itertools, contextlib
-import json, urllib.request, urllib.error
+import json, urllib.request, urllib.error, os, random
 from . import s3util, config, results
 
 MAX_KEYS = 20000           # cap noisy objects per run (0 = unlimited)
@@ -132,9 +132,16 @@ class Pacer:
 
 class LoadGen:
     def __init__(self, bucket=config.OBS_BUCKET_THROTTLE, chunk=CHUNK,
-                 max_keys=MAX_KEYS, timeout_s=(3, 10), run_id=None):
+                 max_keys=MAX_KEYS, timeout_s=(3, 10), run_id=None,
+                 noisy_chunk=None, noisy_random=False, critical_objects=1,
+                 critical_object_kb=None, key_gen=1):
         self.bucket = bucket
         self.chunk = chunk
+        self.noisy_chunk = noisy_chunk or chunk
+        self.noisy_random = noisy_random
+        self.critical_objects = max(1, int(critical_objects or 1))
+        self.critical_object_kb = critical_object_kb or (chunk // 1024)
+        self.key_gen = key_gen
         self.max_keys = max_keys
         self.timeout_s = timeout_s
         self.run_id = run_id or results.run_id()
@@ -153,7 +160,8 @@ class LoadGen:
         self._keys_fail = 0
         self._key_seq = itertools.count(1)
         self._worker_seq = itertools.count(1)
-        self._payload = b"x" * chunk
+        self._payload = b"x" * self.noisy_chunk
+        self._seed_payload = b"x" * (self.critical_object_kb * 1024)
         self.seed_key = None
         self.event_sink = None          # optional per-event callback (agent)
         self.last_settle_error = None
@@ -495,20 +503,22 @@ class LoadGen:
     def _noisy_put(self, worker_id):
         cli = s3util.s3("noisy", timeout_s=self.timeout_s, max_attempts=1)
         rid = self.run_id
+        # one payload buffer per worker, reused for every PUT (never per request)
+        body = (os.urandom(self.noisy_chunk) if self.noisy_random
+                else self._payload)
+        key_gen = (f"n{self.key_gen}-" if self.key_gen and self.key_gen > 1
+                   else "n")
         while not self._stopped("tenant-noisy"):
             if self._paused("tenant-noisy"):
                 time.sleep(0.25); continue
             seq = self._next_key_seq()
-            key = f"{rid}/noisy/n{seq}.bin"
-            pacer = self._pacers["tenant-noisy"]
-            due = pacer.acquire() if pacer is not None else None
+            key = f"{rid}/noisy/{key_gen}{seq}.bin"
             tag, ts = self._cur_tag, time.time()
-            t0 = due if due is not None else time.monotonic()
+            t0 = time.monotonic()
             tok = self._inflight_start("tenant-noisy", ts)
             try:
                 r = cli.put_object(Bucket=self.bucket, Key=key,
-                                   Body=self._payload,
-                                   ContentLength=self.chunk)
+                                   Body=body, ContentLength=len(body))
                 self._rec("tenant-noisy", "PUT", ts,
                           (time.monotonic()-t0)*1000, STATUS_OK,
                           retries=_ok_retries(r), tag=tag)
@@ -522,8 +532,10 @@ class LoadGen:
             finally:
                 self._inflight_end(tok)
 
-    def _critical_get(self, key, interval=0):
+    def _critical_get(self, keys, interval=0):
         cli = s3util.s3("critical", timeout_s=self.timeout_s, max_attempts=1)
+        if isinstance(keys, str):
+            keys = [keys]
         while not self._stopped("tenant-critical"):
             if self._paused("tenant-critical"):
                 time.sleep(0.25); continue
@@ -533,7 +545,8 @@ class LoadGen:
             t0 = due if due is not None else time.monotonic()
             tok = self._inflight_start("tenant-critical", ts)
             try:
-                r = cli.get_object(Bucket=self.bucket, Key=key)
+                r = cli.get_object(Bucket=self.bucket,
+                                   Key=random.choice(keys))
                 with contextlib.closing(r["Body"]) as body:
                     body.read()   # consume + close: true latency, reuse conn
                 self._rec("tenant-critical", "GET", ts,
@@ -574,15 +587,24 @@ class LoadGen:
 
     def start(self, seed_key=None, noisy=True, critical=True,
               noisy_threads=6, critical_threads=2, critical_interval=0,
-              noisy_rate=None, critical_rate=None):
-        """Seed one critical object if needed; launch only the requested
+              critical_rate=None):
+        """Seed the critical objects if needed; launch only the requested
         tenants that are not already running. A running noisy tenant must
         never prevent critical workers from starting (and vice versa)."""
         if seed_key is None:
-            seed_key = self.seed_key or f"{self.run_id}/critical-seed.bin"
+            n = self.critical_objects
+            seed_key = self.seed_key or (
+                f"{self.run_id}/critical-seed.bin" if n <= 1 else
+                [f"{self.run_id}/critical-seed-{i}.bin" for i in range(n)])
             if not self.running("tenant-critical"):
-                s3util.s3("critical").put_object(
-                    Bucket=self.bucket, Key=seed_key, Body=self._payload)
+                cli = s3util.s3("critical")
+                keys = seed_key if isinstance(seed_key, list) else [seed_key]
+                for k in keys:
+                    try:
+                        cli.head_object(Bucket=self.bucket, Key=k)
+                    except Exception:
+                        cli.put_object(Bucket=self.bucket, Key=k,
+                                       Body=self._seed_payload)
         self.seed_key = seed_key
         self.stop_flag.clear(); self.paused.clear()
         if noisy:
@@ -592,21 +614,21 @@ class LoadGen:
             self._tenant_stop["tenant-critical"].clear()
             self._tenant_pause["tenant-critical"].clear()
         if noisy:
-            self.add_noisy(noisy_threads, rate=noisy_rate)
+            self.add_noisy(noisy_threads)
         if critical:
             self.add_critical(critical_threads, seed_key, critical_interval,
                               rate=critical_rate)
         return seed_key
 
-    def add_noisy(self, threads=6, rate=None):
+    def add_noisy(self, threads=6):
         """Launch noisy PUT workers; no-op if any are already alive."""
         if self.remote_noisy is not None:
-            return self.remote_noisy.add_noisy(threads, rate=rate)
+            return self.remote_noisy.add_noisy(threads)
         if self.running("tenant-noisy"):
             return 0
         self._tenant_stop["tenant-noisy"].clear()
         self._tenant_pause["tenant-noisy"].clear()
-        self._pacers["tenant-noisy"] = Pacer(rate) if rate else None
+        self._pacers["tenant-noisy"] = None
         for _ in range(threads):
             t = threading.Thread(target=self._noisy_put,
                                  args=(next(self._worker_seq),), daemon=True)
@@ -673,11 +695,6 @@ class LoadGen:
     def pause_critical(self):   self._tenant_pause["tenant-critical"].set()
     def resume_critical(self):  self._tenant_pause["tenant-critical"].clear()
 
-    def set_noisy_rate(self, rate):
-        if self.remote_noisy is not None:
-            self.remote_noisy.set_noisy_rate(rate); return
-        self._pacers["tenant-noisy"] = Pacer(rate) if rate else None
-
     def set_critical_rate(self, rate):
         self._pacers["tenant-critical"] = Pacer(rate) if rate else None
 
@@ -723,7 +740,7 @@ class LoadGen:
         return rows, distinct
 
     def noisy_burst(self, bucket, prefix, seconds=20, threads=4, size=1024,
-                    keys_per_thread=50):
+                    keys_per_thread=0):
         """Short tenant-noisy PUT burst under one key prefix — local or on
         the remote noisy host when NOISY_HOST is configured."""
         if self.remote_noisy is not None:
@@ -737,7 +754,7 @@ class LoadGen:
 
 
 def put_burst(user, bucket, prefix, seconds=20, threads=4, size=1024,
-              keys_per_thread=50):
+              keys_per_thread=0):
     """Short PUT burst by one PoC user under one key prefix, client retries
     off. Used to compare a rule-covered prefix with a control prefix.
     Returns the same aggregate as phase_stats() plus ok_tps / seconds."""
@@ -752,8 +769,10 @@ def put_burst(user, bucket, prefix, seconds=20, threads=4, size=1024,
             i += 1
             ts, t0 = time.time(), time.monotonic()
             try:
+                # keys_per_thread=0 (default) => every PUT a unique key
+                suffix = i if not keys_per_thread else i % keys_per_thread
                 r = cli.put_object(Bucket=bucket, Body=body,
-                                   Key=f"{prefix}k{wid}-{i % keys_per_thread}.bin")
+                                   Key=f"{prefix}k{wid}-{suffix}.bin")
                 ev = (ts, (time.monotonic() - t0) * 1000, STATUS_OK, "",
                       _ok_retries(r))
             except Exception as e:
@@ -794,7 +813,8 @@ class RemoteNoisy:
     remote-specific logic."""
 
     def __init__(self, lg, base_url, token="", bucket=config.OBS_BUCKET_THROTTLE,
-                 run_id=None, threads=6, max_keys=MAX_KEYS, chunk=CHUNK,
+                 run_id=None, threads=6, max_keys=MAX_KEYS,
+                 chunk=config.NOISY_OBJECT_KB * 1024, noisy_random=False,
                  timeout_s=(3, 10), poll_s=1.0):
         self.lg = lg
         self.base_url = base_url if "://" in base_url else f"http://{base_url}"
@@ -804,6 +824,7 @@ class RemoteNoisy:
         self.threads = threads
         self.max_keys = max_keys
         self.chunk = chunk
+        self.noisy_random = noisy_random
         self.timeout_s = timeout_s
         self.poll_s = poll_s
         self.cursor = 0
@@ -817,6 +838,7 @@ class RemoteNoisy:
         self._last_poll_ok = None
         self._bad_since = None
         self.outages = []
+        self.event_gap = None
         self.closed = False
         self._stop = threading.Event()
         self._poll_lock = threading.Lock()
@@ -917,16 +939,13 @@ class RemoteNoisy:
         return [row, crit], ok
 
     # ---------- noisy controls (same shape as LoadGen) ----------
-    def add_noisy(self, threads=6, rate=None):
+    def add_noisy(self, threads=6):
         body = {"threads": int(threads), "run_id": self.run_id,
                 "bucket": self.bucket, "max_keys": self.max_keys,
                 "chunk": self.chunk, "timeout_s": list(self.timeout_s),
-                "rate": rate}
+                "noisy_random": self.noisy_random}
         res = self._request("POST", "/noisy/start", body, timeout=15)
         return int(res.get("launched", 0))
-
-    def set_noisy_rate(self, rate):
-        self._request("POST", "/noisy/rate", {"rate": rate}, timeout=10)
 
     def pause_noisy(self):
         self._request("POST", "/noisy/pause", {}, timeout=10)
@@ -939,7 +958,7 @@ class RemoteNoisy:
         return int(res.get("lingering", 0))
 
     def burst(self, bucket, prefix, seconds=20, threads=4, size=1024,
-              keys_per_thread=50):
+              keys_per_thread=0):
         return self._request("POST", "/burst", {
             "bucket": bucket, "prefix": prefix, "seconds": seconds,
             "threads": threads, "size": size,
@@ -964,8 +983,17 @@ class RemoteNoisy:
         # The background poller and settle()/flush() share the cursor; without
         # this lock two pulls can request the same `since` and double-ingest.
         with self._poll_lock:
-            res = self._request("GET", f"/events?since={self.cursor}",
+            want_since = self.cursor
+            res = self._request("GET", f"/events?since={want_since}",
                                 timeout=15)
+            # V4-6: the agent drops old events past its cap; if the oldest
+            # retained seq is ahead of what we asked for, events were lost
+            # before we could pull them — the phase must FAIL, not pass.
+            first_seq = res.get("first_seq")
+            if (first_seq is not None and first_seq > want_since + 1
+                    and self.event_gap is None):
+                self.event_gap = (f"noisy agent dropped events "
+                                  f"{want_since + 1}..{first_seq - 1}")
             n = 0
             for ev in res.get("events", []):
                 if ev.get("tenant") != "tenant-noisy" or ev.get("op") != "PUT":
@@ -1032,7 +1060,8 @@ class RemoteNoisy:
                 "last_ok": self.last_ok,
                 "contact_age_s": round(now - self.last_ok, 3)
                 if self.last_ok else None,
-                "contact_ok": self.contact_ok()}
+                "contact_ok": self.contact_ok(),
+                "event_gap": self.event_gap}
 
     def flush(self, until_ts, timeout_s=15):
         """Pull until every request that started before until_ts has been

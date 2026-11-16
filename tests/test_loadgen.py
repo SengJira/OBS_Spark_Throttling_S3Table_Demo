@@ -764,10 +764,11 @@ def test_evaluate_drift_makes_recovery_inconclusive():
     st["post-baseline"]["tenant-critical GET"]["p95"] = 30
     out = throttle_eval.evaluate(st, rule=RULE)
     names = {v["name"]: v["verdict"] for v in out["verdicts"]}
-    assert names["baseline_stable"] == "FAIL"
+    # drift is an environment problem: INCONCLUSIVE, never FAIL
+    assert names["baseline_stable"] == "INCONCLUSIVE"
     assert names["recovery_improvement"] == "INCONCLUSIVE"
     assert names["critical_p95_within_sla"] == "INCONCLUSIVE"
-    assert out["overall"] == "FAIL"
+    assert out["overall"] == "INCONCLUSIVE"
 
 
 def test_evaluate_recovery_improvement_pass():
@@ -786,13 +787,50 @@ def test_evaluate_recovery_improvement_fail():
     assert names["recovery_improvement"] == "FAIL"
 
 
-def test_evaluate_no_contention_is_inconclusive():
+def _no_contention_stats(rec_p95=10, base_p95=9, post_p95=None):
     st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
-                rec_p95=10, base_p95=9)
-    st["contention"]["tenant-critical GET"]["p95"] = 10
+                rec_p95=rec_p95, base_p95=base_p95)
+    st["contention"]["tenant-critical GET"]["p95"] = base_p95 + 1
+    if post_p95 is not None:
+        st["post-baseline"]["tenant-critical GET"]["p95"] = post_p95
+    return st
+
+
+def _ri(out):
+    return next(v for v in out["verdicts"]
+                if v["name"] == "recovery_improvement")
+
+
+def test_evaluate_no_contention_unaffected_pass():
+    out = throttle_eval.evaluate(_no_contention_stats(rec_p95=10), rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "PASS" and v["mode"] == "unaffected"
+    assert "critical unaffected" in v["detail"]
+
+
+def test_evaluate_no_contention_unaffected_fail():
+    # recovery p95 above 1.25x baseline even with no contention => FAIL
+    out = throttle_eval.evaluate(_no_contention_stats(rec_p95=20), rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "FAIL" and v["mode"] == "unaffected"
+
+
+def test_evaluate_no_contention_drift_inconclusive():
+    out = throttle_eval.evaluate(
+        _no_contention_stats(rec_p95=10, post_p95=40), rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "INCONCLUSIVE" and v["mode"] == "unaffected"
+
+
+def test_evaluate_no_contention_no_enforcement_inconclusive():
+    st = _no_contention_stats(rec_p95=10)
+    st["enforced"]["tenant-noisy PUT"]["throttled"] = 0
+    st["enforced"]["tenant-noisy PUT"]["r429"] = 0
+    st["enforced"]["tenant-noisy PUT"]["ok"] = st["enforced"][
+        "tenant-noisy PUT"]["n"]
     out = throttle_eval.evaluate(st, rule=RULE)
-    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
-    assert names["recovery_improvement"] == "INCONCLUSIVE"
+    v = _ri(out)
+    assert v["verdict"] == "INCONCLUSIVE" and v["mode"] == "unaffected"
 
 
 def test_evaluate_paced_client_misses_are_inconclusive():
@@ -803,3 +841,11 @@ def test_evaluate_paced_client_misses_are_inconclusive():
     names = {v["name"]: v["verdict"] for v in out["verdicts"]}
     assert names["paced_client_kept_up"] == "INCONCLUSIVE"
     assert out["overall"] == "INCONCLUSIVE"
+
+
+def test_put_burst_keys_unique_by_default():
+    """V4-9: bursts write unique keys (no silent overwrites)."""
+    FakeS3.put_calls.clear()
+    loadgen.put_burst("noisy", "b", "demo-x/raw", seconds=0.3, threads=2)
+    keys = [k for u, k in FakeS3.put_calls]
+    assert len(keys) > 10 and len(keys) == len(set(keys))

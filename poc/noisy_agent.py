@@ -35,8 +35,16 @@ class AgentState:
         self.idle_stopped = False
         self.watchdog_stop = threading.Event()
         self.event_seq = 0
-        self.event_log = []
+        self.event_log = {}              # seq -> rec, bounded (V4-6)
+        self.event_dropped = 0
+        self.MAX_EVENTS = 500000
+        self._key_gens = {}              # run_id -> generation (V4-8)
         self.event_lock = threading.Lock()
+
+    def _next_key_gen(self, run_id):
+        g = self._key_gens.get(run_id, 0) + 1
+        self._key_gens[run_id] = g
+        return g
 
     def _on_event(self, ev):
         rec = {"ts": ev.ts, "tenant": ev.tenant, "op": ev.op,
@@ -45,14 +53,20 @@ class AgentState:
         with self.event_lock:
             self.event_seq += 1
             rec["seq"] = self.event_seq
-            self.event_log.append(rec)
+            self.event_log[self.event_seq] = rec
+            over = len(self.event_log) - self.MAX_EVENTS
+            if over > 0:
+                for s in sorted(self.event_log)[:over]:
+                    del self.event_log[s]
+                    self.event_dropped += 1
 
     def events_since(self, since):
         with self.event_lock:
             start = max(0, int(since))
-            if start >= len(self.event_log):
-                return [], self.event_seq
-            return list(self.event_log[start:]), self.event_seq
+            evs = [self.event_log[s] for s in sorted(self.event_log)
+                   if s > start]
+            first = min(self.event_log) if self.event_log else self.event_seq + 1
+            return evs, self.event_seq, first, self.event_dropped
 
     def inflight_info(self):
         if self.lg is None:
@@ -86,7 +100,9 @@ class AgentState:
                   "bucket": body.get("bucket") or config.OBS_BUCKET_THROTTLE,
                   "max_keys": int(body.get("max_keys", loadgen.MAX_KEYS)),
                   "chunk": int(body.get("chunk", loadgen.CHUNK)),
-                  "timeout_s": tuple(body.get("timeout_s") or (3, 10))}
+                  "timeout_s": tuple(body.get("timeout_s") or (3, 10)),
+                  "noisy_random": bool(body.get("noisy_random")),
+                  "key_gen": self._next_key_gen(run_id)}
         with self.lock:
             if self.lg is not None and self.lg.running("tenant-noisy"):
                 old_run = (self.params or {}).get("run_id")
@@ -97,7 +113,9 @@ class AgentState:
                                       bucket=params["bucket"],
                                       max_keys=params["max_keys"],
                                       chunk=params["chunk"],
-                                      timeout_s=params["timeout_s"])
+                                      timeout_s=params["timeout_s"],
+                                      noisy_random=params["noisy_random"],
+                                      key_gen=params["key_gen"])
             self.lg.event_sink = self._on_event
             self.params = params
             self.idle_stopped = False
@@ -221,16 +239,21 @@ class Handler(BaseHTTPRequestHandler):
                             "noisy": state.noisy_status(),
                             "s3": state.s3_status()})
             elif path == "/status":
+                first = (min(state.event_log) if state.event_log
+                         else state.event_seq + 1)
                 self._json({"ok": True, "agent_time": time.time(),
                             "event_cursor": state.event_seq,
                             "events_total": state.event_seq,
+                            "events_first_seq": first,
+                            "events_dropped": state.event_dropped,
                             "noisy": state.noisy_status(),
                             "idle_stopped": state.idle_stopped})
             elif path == "/events":
                 since = int(self._qs().get("since", ["0"])[0])
-                evs, cur = state.events_since(since)
+                evs, cur, first, dropped = state.events_since(since)
                 inflight, oldest = state.inflight_info()
                 self._json({"events": evs, "cursor": cur,
+                            "first_seq": first, "dropped": dropped,
                             "inflight": inflight,
                             "oldest_inflight_ts": oldest,
                             "agent_time": time.time()})
@@ -258,19 +281,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(state.preflight(run_id))
             elif path == "/noisy/start":
                 lg = state.ensure_lg(body)
-                n = lg.add_noisy(int(body.get("threads", 6)),
-                                 rate=body.get("rate"))
+                n = lg.add_noisy(int(body.get("threads", 6)))
                 self._json({"ok": True, "launched": n,
                             "running": lg.running("tenant-noisy"),
                             "threads": len(lg.threads["tenant-noisy"]),
                             "lingering": lg.lingering("tenant-noisy"),
                             "run_id": lg.run_id})
-            elif path == "/noisy/rate":
-                if state.lg is None:
-                    self._json({"ok": False, "error": "no generator"}, 409)
-                    return
-                state.lg.set_noisy_rate(body.get("rate"))
-                self._json({"ok": True})
             elif path == "/noisy/stop":
                 n = state.lg.stop_noisy() if state.lg is not None else 0
                 self._json({"ok": True, "lingering": n,
