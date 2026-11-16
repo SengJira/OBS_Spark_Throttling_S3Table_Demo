@@ -38,20 +38,23 @@ output-free), the report in `reports/PoC_Report.html`. Or run in JupyterLab:
 |---|---|---|
 | `DEMO_SCALE_GB` | `1` | dataset size for notebook 01: ≈ 8 M rows per unit (1 GiB of uncompressed row data, ≈ 0.09 GB of Parquet on ObjectScale) |
 | `THROTTLE_PHASE_S` | `60` | notebook 02 phase length (the enforced phase is 2×) |
-| `PROPAGATION_S` | `300` | minimum age of the stored rules before enforcement is measured (ObjectScale rule cache: 300 s) |
 | `THROTTLE_SETTLE_S` | `120` | how long to wait for the mode switch to become visible |
 | `CRITICAL_RATE` | `100` | critical GET offer rate in notebook 02 (req/s); `0` = as fast as possible |
-| `QUEUE_TEST` | `0` | `1` adds the `enforced-24` queue-cost probe after recovery |
 | `POC_RUN_ID` | `demo-<timestamp>` | one run ID for the whole suite |
 | `NOISY_HOST` | empty | `host:port` of `poc/noisy_agent.py` on the second client host; empty keeps noisy PUTs local on U01 |
 | `NOISY_AGENT_TOKEN` | empty | shared `X-POC-Token` header for U01 ↔ U02 control traffic |
 
 Approximate run time at the defaults (2-vCPU lab host): `99_reset` 1–3 min,
-`00` 0.5 min, `01` ≈ 3 min, `02` ≈ 16 min (60 s baseline + 60 s contention +
-60 s dry-run + ≈ 120 s remaining propagation wait with the noisy tenant
-paused + 60 s pre-baseline + 60 s reference + mode switch + 120 s enforced +
-60 s recovery + 60 s post-baseline + optional enforced-24 + prefix bursts +
-two Spark writes), `03` ≈ 3 min, `04` < 0.5 min — **≈ 27 min in total**.
+`00` 0.5 min, `01` ≈ 3 min, `02` ≈ 12 min (60 s baseline + 60 s contention +
+60 s dry-run + mode switch + 120 s enforced + 60 s recovery + 60 s
+post-baseline + prefix bursts + two Spark writes), `03` ≈ 3 min,
+`04` < 0.5 min — **≈ 22 min in total**.
+
+Run `99_reset` at least **5 minutes** before notebook 02: it stages the two
+throttle rules with the throttler disabled, and ObjectScale needs up to
+300 s (`rules_config_cache_expiration_time`) before a stored rule is
+enforced. Notebook 02 shows a countdown only if the rules are still younger
+than 300 s — normally there is none.
 
 ### Remote noisy agent (optional second client host)
 
@@ -195,8 +198,9 @@ findings. In short:
   delays and rejects — accepted requests are queued to hold the rate at the
   limit, the overflow gets HTTP 429 `TooManyRequests`. SDK retries hide those
   429s, so the load generator disables them.
-- **Rule propagation:** rules are cached for up to 300 s; notebook 02 stores
-  them first and measures enforcement only after `PROPAGATION_S`.
+- **Rule propagation:** rules are cached for up to 300 s; `99_reset` stages
+  them minutes ahead and notebook 02 measures enforcement only once they are
+  old enough (a countdown appears only if they are still younger than 300 s).
 - **Iceberg runtime:** OBS SigV4 for `s3tables` double-encodes the canonical
   path — handled by a one-line patch in the locally built Iceberg 4.2 runtime
   (`scripts/build_iceberg.sh`, which verifies checksum, patch and jar). The jar

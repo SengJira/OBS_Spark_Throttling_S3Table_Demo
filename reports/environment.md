@@ -341,3 +341,32 @@ What this shows:
 - **Clock offset:** after switching to the lowest-RTT `/health` sample,
   remote offsets were ≈0.1–8.9 ms (one earlier run showed single-sample
   spikes to ≈−128 ms from HTTP latency, which the guard correctly rejected).
+
+## Simplified demo flow (six phases + staged rules)
+
+Notebook 02 now shows six measured phases — baseline, contention,
+simulation (dry-run), enforced (HTTP 429), recovery, post-baseline — then
+the prefix test, Spark write, lifecycle check, verdicts and restore. The
+in-demo propagation wait, pre-baseline, paced-noisy reference and
+`QUEUE_TEST`/`enforced-24` probe were removed to keep the customer flow
+simple.
+
+- `99_reset` verifies and stores `demo-noisy-put` (all tenant-noisy PUTs,
+  50 TPS) and `demo-raw-prefix` (`demo-*/raw/*`, 10 TPS) with the throttler
+  disabled, then records `reports/rules_staged_at`. ObjectScale caches the
+  rule set for up to 300 s, so running reset ≥5 min before notebook 02 hides
+  the propagation wait; notebook 02 only counts down if the rules are still
+  younger than 300 s.
+- The rules are run-id agnostic (`demo-*/raw/*`) because `99_reset` runs
+  before the notebook's `run_id` exists; both rules come from
+  `poc/demo_rules.py` so staging and enforcement cannot drift apart.
+- Recovery is judged by `recovery_improvement`: share =
+  (contention_p95 − recovery_p95) / (contention_p95 − baseline_p95), PASS at
+  ≥ 0.5 with enforcement observed; INCONCLUSIVE on environment drift, no
+  enforcement, or < 2 ms of contention. `baseline_stable` compares
+  post-baseline to baseline only; `recovery_p95_vs_baseline` is information
+  only and does not affect the overall verdict.
+- Critical pacing is configurable via `CRITICAL_RATE` (default 100 GET/s,
+  open-loop with missed-slot tracking; `0` = as fast as possible). The lab
+  validation for this change used `CRITICAL_RATE=0` (unpaced) per operator
+  request, so the paced-client guard is omitted on those runs.
