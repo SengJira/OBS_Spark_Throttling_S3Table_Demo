@@ -548,7 +548,7 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
                             f"{'yes' if enforcement_active else 'no'}" + note})
 
     # 5. recovery vs baseline p95 — INFORMATION ONLY (single-host CPU noise
-    #    made this check unfair; recovery_vs_reference is the scored verdict)
+    #    made this check unfair; recovery_improvement is the scored verdict)
     if rec_crit.get("n", 0) >= th["min_requests"] and base.get("p95"):
         dev = rec_crit["p95"] / max(1e-9, base["p95"])
         detail = (f"recovery p95={rec_crit['p95']:.1f}ms "

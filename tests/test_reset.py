@@ -139,6 +139,7 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(s3util, "s3tables", lambda *a, **k: st)
     monkeypatch.setattr(reset, "LEDGER", tmp_path / "ledger.json")
     monkeypatch.setattr(reset, "restore_throttler", lambda backup=None: "restored")
+    monkeypatch.setattr(reset, "stage_rules", lambda: "staged")
     monkeypatch.setattr(reset.time, "sleep", lambda s: None)
     return s3, st
 

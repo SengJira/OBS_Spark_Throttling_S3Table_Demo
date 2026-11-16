@@ -15,7 +15,8 @@ full_reset(dry_run=True) returns the same plan without changing anything.
 """
 import json, time
 
-from . import s3util, config
+from . import s3util, config, demo_rules
+from . import throttle_eval as te
 from .obs_admin import MgmtApi, Throttler
 
 DEMO_PREFIXES = ("demo-",)
@@ -273,6 +274,28 @@ def restore_throttler(backup=None):
     return Throttler(MgmtApi()).restore(backup or config.BACKUP_FILE)
 
 
+RULES_STAGED_AT = config.REPORT_DIR / "rules_staged_at"
+
+
+def stage_rules():
+    """Store the demo rules with the throttler disabled and record the push
+    time, so notebook 02 reads the propagation age instead of waiting the
+    full rules_config_cache_expiration_time inside the demo."""
+    thr = Throttler(MgmtApi())
+    rules = demo_rules.demo_rules()
+    checks = {r["id"]: te.verify_rule(thr, r) for r in rules}
+    ok = all(c["ok"] for c in checks.values())
+    if not ok:
+        raise RuntimeError("demo rules failed verification: " + json.dumps(
+            {k: v["problems"] for k, v in checks.items() if not v["ok"]}))
+    keep = [r for r in thr.get_rules() if not demo_rules.is_demo_rule(r)]
+    thr.set_mode("disabled")
+    thr.put_config(keep + rules)
+    RULES_STAGED_AT.write_text(str(time.time()))
+    return {"staged": True, "rules": [r["id"] for r in rules],
+            "verify": {k: v["ok"] for k, v in checks.items()}}
+
+
 def full_reset(backup=None, dry_run=False, wait_s=120):
     """Reset the PoC. With dry_run=True nothing is changed; the returned
     structure lists what a real reset would delete."""
@@ -289,4 +312,6 @@ def full_reset(backup=None, dry_run=False, wait_s=120):
     out["unattributed_left_alone"] = drop["unattributed_left_alone"]
     out["notes"] = drop["notes"]
     out["seed"] = None if dry_run else ensure_seed_structure()
+    out["rules_staged"] = ("would stage demo rules" if dry_run
+                           else stage_rules())
     return out
