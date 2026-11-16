@@ -352,14 +352,20 @@ in-demo propagation wait, pre-baseline, paced-noisy reference and
 simple.
 
 - `99_reset` verifies and stores `demo-noisy-put` (all tenant-noisy PUTs,
-  50 TPS) and `demo-raw-prefix` (`demo-*/raw/*`, 10 TPS) with the throttler
-  disabled, then records `reports/rules_staged_at`. ObjectScale caches the
-  rule set for up to 300 s, so running reset ≥5 min before notebook 02 hides
-  the propagation wait; notebook 02 only counts down if the rules are still
-  younger than 300 s.
-- The rules are run-id agnostic (`demo-*/raw/*`) because `99_reset` runs
-  before the notebook's `run_id` exists; both rules come from
-  `poc/demo_rules.py` so staging and enforcement cannot drift apart.
+  50 TPS) and `demo-raw-prefix` (`demo-raw-covered/*`, 10 TPS) with the
+  throttler disabled, then records `reports/rules_staged_at`. ObjectScale
+  caches the rule set for up to 300 s, so running reset ≥5 min before
+  notebook 02 hides the propagation wait; notebook 02 only counts down if
+  the rules are still younger than 300 s.
+- The rules are run-id agnostic because `99_reset` runs before the
+  notebook's `run_id` exists; both rules come from `poc/demo_rules.py` so
+  staging and enforcement cannot drift apart. The covered prefix is the
+  fixed `demo-raw-covered/` (still cleaned by reset's `demo-` sweep); the
+  control burst stays under `<run_id>/curated/`.
+- **`paths` validation (new finding):** a `paths` value accepts at most one
+  `*` and only as the last character — `demo-*/raw/*`, `*/raw/*` and
+  `a*/b*` are all rejected with `400 paths value … not valid`. A single
+  trailing wildcard (`poc/poc-throttle/demo-raw-covered/*`) is accepted.
 - Recovery is judged by `recovery_improvement`: share =
   (contention_p95 − recovery_p95) / (contention_p95 − baseline_p95), PASS at
   ≥ 0.5 with enforcement observed; INCONCLUSIVE on environment drift, no

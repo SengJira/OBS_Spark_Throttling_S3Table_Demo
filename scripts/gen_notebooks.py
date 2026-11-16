@@ -408,7 +408,7 @@ def aux_metrics(name):
        "leftover noisy load, and that U01/U02 clocks agree within 50 ms."),
  md("## Step 2 — Lab rules: staged by 99_reset, verified here (TC2.2)\n"
     "Two rules for the noisy tenant: all PUTs capped at 50 TPS, and a "
-    "tighter 10 TPS cap on one key prefix (`demo-*/raw/*`). `99_reset` "
+    "tighter 10 TPS cap on one key prefix (`demo-raw-covered/*`). `99_reset` "
     "already stored them with the throttler disabled; this step verifies "
     "them against the live schema and reads their age. If they are missing "
     "they are staged now and the propagation clock restarts."),
@@ -418,7 +418,7 @@ NOISY_RULE = demo_rules.noisy_put_rule()
 PREFIX_RULE = demo_rules.prefix_put_rule()
 LIMIT, PREFIX_LIMIT = (NOISY_RULE["limit"]["value"],
                        PREFIX_RULE["limit"]["value"])
-COVERED, CONTROL = f"{RID}/raw", f"{RID}/curated"
+COVERED, CONTROL = "demo-raw-covered", f"{RID}/curated"
 STAGED_FILE = config.REPORT_DIR / "rules_staged_at"
 checks = {r["id"]: te.verify_rule(thr, r) for r in (NOISY_RULE, PREFIX_RULE)}
 viz.table(pd.DataFrame([{"rule": rid, "schema_ok": c["ok"],
@@ -707,7 +707,7 @@ viz.banner(st5, "TC2.5 recovery",
        "because single-host CPU noise made it unfair."),
  md("## Step 9 — Prefix-scoped rule (TC2.6)\n"
     "The second rule caps the noisy tenant at 10 TPS under "
-    "`demo-*/raw/*` only. Real traffic decides: one PUT burst to the "
+    "`demo-raw-covered/` only. Real traffic decides: one PUT burst to the "
     "covered prefix and one to a control prefix (`<run_id>/curated/`). "
     "PASS only if the covered prefix is held at its limit while the "
     "control prefix runs clearly above it."),

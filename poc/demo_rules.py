@@ -4,8 +4,9 @@ Both ``99_reset`` (staging) and notebook 02 (verification/enforcement) build
 the same two rules from here so the staged rules and the demo rules can never
 drift apart. The rules are run-id agnostic: ``99_reset`` stages them minutes
 before a notebook run whose ``run_id`` is not known yet, so the prefix rule
-matches ``demo-*/raw/*`` (the wildcard spans ``/``). Verification stays in
-``poc.throttle_eval.verify_rule``.
+matches the fixed ``demo-raw-covered/`` prefix (ObjectScale accepts only a
+single trailing ``*`` in a ``paths`` value — ``demo-*/raw/*`` is rejected).
+Verification stays in ``poc.throttle_eval.verify_rule``.
 """
 from poc import config
 
@@ -13,7 +14,7 @@ NOISY_RULE_ID = "demo-noisy-put"
 PREFIX_RULE_ID = "demo-raw-prefix"
 DEFAULT_NOISY_LIMIT = 50
 DEFAULT_PREFIX_LIMIT = 10
-RAW_GLOB = "demo-*/raw/*"
+RAW_GLOB = "demo-raw-covered/*"
 
 
 def noisy_principal():
