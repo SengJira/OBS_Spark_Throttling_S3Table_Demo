@@ -39,7 +39,12 @@ output-free), the report in `reports/PoC_Report.html`. Or run in JupyterLab:
 | `DEMO_SCALE_GB` | `1` | dataset size for notebook 01: ≈ 8 M rows per unit (1 GiB of uncompressed row data, ≈ 0.09 GB of Parquet on ObjectScale) |
 | `THROTTLE_PHASE_S` | `60` | notebook 02 phase length (the enforced phase is 2×) |
 | `THROTTLE_SETTLE_S` | `120` | how long to wait for the mode switch to become visible |
-| `CRITICAL_RATE` | `100` | critical GET offer rate in notebook 02 (req/s); `0` = as fast as possible |
+| `CRITICAL_RATE` | `0` | critical GET offer rate in notebook 02 (req/s); `0` = as fast as possible. Pacing is experimental — it needs enough threads for the rate |
+| `NOISY_THREADS` | `6` | noisy PUT worker threads (local or on U02) |
+| `NOISY_OBJECT_KB` | `64` | KiB per noisy PUT |
+| `PAYLOAD_RANDOM` | `0` | `1` = random (uncompressible) bytes per worker |
+| `CRITICAL_OBJECTS` | `1` | seed objects critical GETs read at random |
+| `CRITICAL_OBJECT_KB` | `64` | KiB per critical seed object |
 | `POC_RUN_ID` | `demo-<timestamp>` | one run ID for the whole suite |
 | `NOISY_HOST` | empty | `host:port` of `poc/noisy_agent.py` on the second client host; empty keeps noisy PUTs local on U01 |
 | `NOISY_AGENT_TOKEN` | empty | shared `X-POC-Token` header for U01 ↔ U02 control traffic |
@@ -73,6 +78,12 @@ and the live chart stay on U01 (`192.168.1.40`). ObjectScale is unchanged.
   It binds only to the U02 address, requires `X-POC-Token`, and stops noisy
   workers if U01 stops polling for `NOISY_AGENT_IDLE_S` (default 60 s).
 - Firewall: allow TCP 8765 only from `192.168.1.40`.
+- The control plane is plain HTTP on the lab LAN: the `X-POC-Token` header
+  is sent unencrypted. Mitigations: the firewall rule above, a random
+  per-deployment token in 0600 env files, and the agent refusing to start
+  without an explicit bind address and token. For anything beyond a lab,
+  put the agent behind TLS (or an SSH tunnel) — the agent does not serve
+  TLS itself.
 - Notebook 02 Step 1 refuses to run if `/health` reports a U01/U02 clock
   offset over 50 ms, if the agent cannot reach ObjectScale on 9021, or if the
   remote PUT/GET probe does not run as `tenant-noisy`. It also stops any

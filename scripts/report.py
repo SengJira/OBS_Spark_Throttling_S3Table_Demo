@@ -14,14 +14,10 @@ CSS = {"PASS": "pass", "FAIL": "fail", "INCONCLUSIVE": "inc", "INCOMPLETE": "inc
 
 
 def report_run_id():
-    """Run to report on, taken from stored state only."""
+    """The active run only — never fall back to another run's results."""
     rid = os.environ.get(results.RUN_ID_ENV)
     if not rid and results.RUN_ID_FILE.exists():
         rid = results.RUN_ID_FILE.read_text().strip()
-    everything = results.load_all()
-    if not rid or not any(r.get("run_id") == rid for r in everything.values()):
-        newest = max(everything.values(), key=lambda r: r.get("ts", 0), default=None)
-        rid = newest.get("run_id") if newest else rid
     return rid
 
 
@@ -49,12 +45,15 @@ def build(rid=None):
         f"<td>{html.escape(', '.join(o['missing']) or '—')}</td>"
         f"<td>{html.escape(', '.join(f'{t}: {s}' for t, s in o['not_pass'].items()) or '—')}</td></tr>"
         for o in rows)
-    detail = "".join(
+    detail = ("<tr><td>—</td><td>no results</td>"
+              "<td class='incomplete'>INCOMPLETE</td>"
+              f"<td>no results for run {html.escape(rid)}</td><td>—</td></tr>"
+              if not allr else "".join(
         f"<tr><td>{tc}</td><td>{html.escape(str(r.get('name', '')))}</td>"
         f"{cell(results.status_of(r))}"
         f"<td>{html.escape(str(r.get('detail') or ''))}</td>"
         f"<td><pre>{html.escape(json.dumps(r.get('metrics', {}), indent=1)[:700])}</pre></td></tr>"
-        for tc, r in sorted(allr.items(), key=lambda kv: tc_key(kv[0])))
+        for tc, r in sorted(allr.items(), key=lambda kv: tc_key(kv[0]))))
 
     thr_html = ""
     t29 = allr.get("TC2.9", {}).get("metrics", {})

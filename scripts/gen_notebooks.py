@@ -276,14 +276,18 @@ DUR = {"baseline": PHASE_S, "contention": PHASE_S, "simulation": PHASE_S,
        "burst": max(15, PHASE_S // 3)}
 RID = results.run_id()
 
-lg = LoadGen(max_keys=0)
+lg = LoadGen(max_keys=0, noisy_chunk=config.NOISY_OBJECT_KB * 1024,
+             noisy_random=bool(config.PAYLOAD_RANDOM),
+             critical_objects=config.CRITICAL_OBJECTS,
+             critical_object_kb=config.CRITICAL_OBJECT_KB)
 remote = None
 if config.NOISY_HOST:
     if not config.NOISY_AGENT_TOKEN:
         raise RuntimeError("NOISY_HOST is set but NOISY_AGENT_TOKEN is empty — "
                            "the remote agent requires the shared X-POC-Token header")
     remote = RemoteNoisy(lg, config.NOISY_HOST, token=config.NOISY_AGENT_TOKEN,
-                         run_id=RID, max_keys=0)
+                         run_id=RID, max_keys=0,
+                         noisy_random=bool(config.PAYLOAD_RANDOM))
     try:
         offset, h = remote.check_clock()
         s3ok = (h.get("s3") or {}).get("ok")
@@ -316,7 +320,12 @@ if pol["mode"] == "enabled":
     raise RuntimeError("the throttler is already enforcing — this demo must start "
                        "from mode disabled/dry-run (restore the pre-demo state first)")
 print("run id:", RID, "| phase seconds:", DUR,
-      "| CRITICAL_RATE:", CRITICAL_RATE)
+      "| CRITICAL_RATE:", CRITICAL_RATE,
+      "| NOISY_THREADS:", config.NOISY_THREADS,
+      "| NOISY_OBJECT_KB:", config.NOISY_OBJECT_KB,
+      "| PAYLOAD_RANDOM:", config.PAYLOAD_RANDOM,
+      "| CRITICAL_OBJECTS:", config.CRITICAL_OBJECTS,
+      "x", config.CRITICAL_OBJECT_KB, "KiB")
 if remote is not None:
     print("noisy mode: REMOTE", remote.base_url,
           f"| U01/U02 clock offset {offset:+.1f} ms | agent S3 ok={s3ok}")
@@ -353,7 +362,7 @@ def finish_phase(name):
             st = remote.stats()
             aux["remote"] = {k: st.get(k) for k in
                              ("events_pulled", "poll_errors", "max_gap_s",
-                              "contact_age_s", "last_error")}
+                              "contact_age_s", "last_error", "event_gap")}
             aux["contact_ok"] = bool(st.get("contact_ok"))
             if win[0]:
                 aux["max_outage_s"] = remote.max_outage_between(win[0], end)
@@ -382,6 +391,9 @@ def contact_reason(name):
         err = ((a.get("remote") or {}).get("last_error")
                or a.get("contact_error") or "poll failing")
         return f"lost contact with noisy host ({err})"
+    if (a.get("remote") or {}).get("event_gap"):
+        return ("noisy events dropped before pull: "
+                + a["remote"]["event_gap"])
     if (a.get("max_outage_s") or 0) > 5:
         return f"lost contact with noisy host ({a['max_outage_s']:.1f}s poll gap)"
     if a.get("clock_error"):
@@ -466,6 +478,10 @@ print(f"rules stored {RULE_AGE_S:.0f}s ago (mode {thr.get_mode()}); "
  py('''
 lg.start(noisy=False, critical=True, critical_threads=4,
          critical_rate=CRITICAL_RATE)
+# lg.start() seeds the critical objects once (head-then-put, skipped when
+# they already exist for this run); say what was seeded.
+print(f"critical reads: {config.CRITICAL_OBJECTS} x "
+      f"{config.CRITICAL_OBJECT_KB} KiB objects, seeded once before baseline")
 lg.start_phase("baseline"); chart.mark("baseline")
 chart.refresh(out, seconds=DUR["baseline"])
 aux = finish_phase("baseline")
@@ -487,10 +503,12 @@ viz.banner(st1, "TC2.1 baseline", res["detail"])
        "compared with. Latency is measured from the scheduled send time, so "
        "client stalls are counted, not hidden."),
  md("## Step 4 — Phase 2: contention, throttler disabled (TC2.3)\n"
-    "Noisy PUTs are added on top of the critical GETs. The throttler is "
-    "still disabled, so this is the unprotected impact the rule must fix."),
+    "Noisy PUTs are added on top of the critical GETs with the throttler "
+    "disabled. This measures how much the noisy writer affects the "
+    "critical reader, if at all."),
  py('''
-lg.start_phase("contention"); chart.mark("contention"); lg.add_noisy(threads=6)
+lg.start_phase("contention"); chart.mark("contention")
+lg.add_noisy(threads=config.NOISY_THREADS)
 chart.refresh(out, seconds=DUR["contention"])
 aux = finish_phase("contention")
 ps_all = lg.phase_stats()
@@ -505,8 +523,13 @@ elif cn.get("throttled", 0):
 elif bad:
     st3, why3 = "FAIL", bad
 else:
-    st3, why3 = "PASS", (f"critical p95 {bl.get('p95', 0):.0f} -> {ct.get('p95', 0):.0f} ms "
-                         f"with {cn.get('tps', 0):.0f} noisy PUT/s")
+    delta = ct.get("p95", 0) - bl.get("p95", 0)
+    effect = ("no measurable impact" if delta < 1
+              else f"+{delta:.0f} ms measured impact")
+    st3, why3 = "PASS", (f"critical p95 {bl.get('p95', 0):.0f} -> "
+                         f"{ct.get('p95', 0):.0f} ms ({delta:+.0f} ms) "
+                         f"with {cn.get('tps', 0):.0f} noisy PUT/s — "
+                         f"{effect}")
 res = results.write("TC2.3", "contention (throttler disabled)", status=st3, detail=why3,
     metrics={"baseline_p95": round(bl.get("p95", 0), 1),
              "contention_p95": round(ct.get("p95", 0), 1),
@@ -520,15 +543,21 @@ res = results.write("TC2.3", "contention (throttler disabled)", status=st3, deta
              **aux_metrics("contention")})
 viz.banner(st3, "TC2.3 contention", why3)
 '''),
- notes("Unrestricted noisy PUTs degrade critical latency — the problem "
-       "statement. Caveat for this lab: in LOCAL mode both tenants are "
-       "driven from one 2-vCPU client host, and a CPU-only disturbance on "
-       "that host (no S3 traffic) degrades the critical GETs just as much "
-       "— so the size of this effect cannot be attributed to ObjectScale "
-       "alone (reports/environment.md, 'Client-side contention'). "
-       "client_cpu_pct is recorded per phase. With NOISY_HOST set, the "
-       "noisy PUTs run on the second host and this client-side term is "
-       "removed — compare the same phases between the two modes."),
+ notes("Noisy PUTs are added on top of the critical GETs with the "
+       "throttler disabled — this measures how much the noisy writer "
+       "affects the critical reader, if at all. If there is no impact, "
+       "the story is fairness and quotas: the throttler caps the noisy "
+       "tenant before it can become a problem. TC2.3 is a sanity check "
+       "(both workloads ran, nothing was throttled) — it does not fail "
+       "on 'no impact'. Caveat for this lab: in LOCAL mode both tenants "
+       "are driven from one 2-vCPU client host, and a CPU-only "
+       "disturbance on that host (no S3 traffic) degrades the critical "
+       "GETs just as much — so the size of this effect cannot be "
+       "attributed to ObjectScale alone (reports/environment.md, "
+       "'Client-side contention'). client_cpu_pct is recorded per phase. "
+       "With NOISY_HOST set, the noisy PUTs run on the second host and "
+       "this client-side term is removed — compare the same phases "
+       "between the two modes."),
  md("## Step 5 — Phase 3: simulation mode, dry-run (TC2.10)\n"
     "Mode **dry-run** (ObjectScale simulation mode): the server only counts "
     "rule matches. Both workloads continue — the client must see **zero** "
@@ -564,12 +593,11 @@ viz.banner(st10, "TC2.10 simulation", why10)
        "are a server-side concept: they are probed and reported as "
        "unavailable when the build does not expose them — never invented."),
  md("## Step 6 — Phase 4: enforcement, HTTP 429 (TC2.4)\n"
-    "Mode **enabled**, response code 429, noisy back to as-fast-as-"
-    "possible 6 threads. The switch is read back, the notebook waits until "
+    "Mode **enabled**, response code 429; the noisy tenant keeps running "
+    "as fast as it can. The switch is read back, the notebook waits until "
     "the new mode is visibly in effect (tagged `switching`), then measures "
     "the `enforced` phase with both workloads running."),
  py('''
-lg.set_noisy_rate(None)
 wait_end = PUSHED_AT + RULE_PROPAGATION_S
 if (left := wait_end - time.time()) > 0:
     countdown = w.HTML(); display(countdown)
@@ -631,22 +659,24 @@ viz.banner(st4, "TC2.4 enforcement", why4)
        "queues requests to hold the accepted rate at the limit (latency "
        "tail grows) and rejects the overflow with 429 TooManyRequests. "
        "codes{} lists the S3 error codes exactly as received."),
- md("## Step 7 — Phase 5: recovery observation\n"
-    "**No configuration change here** — enforcement from Step 8 stays "
-    "active and the noisy tenant keeps offering as-fast-as-possible. This "
-    "phase measures critical latency while noisy is capped at the limit; "
-    "the verdict is written after post-baseline so the drift guard has "
-    "both critical-alone readings."),
+ md("## Step 7 — Phase 5: sustained enforcement\n"
+    "**No configuration change here** — enforcement from Step 6 stays "
+    "active and the noisy tenant keeps offering as fast as it can. This "
+    "phase shows the cap holding for another minute: it measures critical "
+    "latency while noisy is still capped at the limit. The verdict is "
+    "written after post-baseline so the drift guard has both "
+    "critical-alone readings. (Internal phase id stays `recovery` for "
+    "result compatibility.)"),
  py('''
-lg.start_phase("recovery"); chart.mark("recovery (enforcement continues)")
+lg.start_phase("recovery"); chart.mark("sustained enforcement")
 chart.refresh(out, seconds=DUR["recovery"])
 aux = finish_phase("recovery")
-print("recovery measured; verdict written after post-baseline")
+print("sustained enforcement measured; verdict written after post-baseline")
 '''),
- notes("The mechanism is the already-running enforcement, observed longer "
-       "— not a second action. The rule still admits ~50 noisy PUT/s by "
-       "design, so the critical workload shares the system with that "
-       "admitted load."),
+ notes("Nothing changes in this phase — the already-running enforcement "
+       "is observed for another minute to show the cap holds. The rule "
+       "still admits ~50 noisy PUT/s by design, so the critical workload "
+       "shares the system with that admitted load."),
  md("## Step 8 — Post-baseline + recovery verdict (TC2.5)\n"
     "The noisy tenant is **stopped** while enforcement stays on: a second "
     "critical-alone reading that detects environment drift. TC2.5 is "
@@ -676,7 +706,7 @@ if contact_fails:
 rp = ps_all.get("recovery", {})
 rc, rn = rp.get("tenant-critical GET", {}), rp.get("tenant-noisy PUT", {})
 rec_span = max(1e-9, rp.get("_window", {}).get("seconds", 1))
-res = results.write("TC2.5", "recovery observation under sustained throttling",
+res = results.write("TC2.5", "sustained enforcement under throttling",
     status=st5, detail=why5,
     metrics={"baseline_p95": round(ps_all["baseline"].get("tenant-critical GET", {}).get("p95", 0), 1),
              "post_baseline_p95": round(ps_all.get("post-baseline", {}).get("tenant-critical GET", {}).get("p95", 0), 1),
@@ -687,6 +717,8 @@ res = results.write("TC2.5", "recovery observation under sustained throttling",
              "critical_errors": rc.get("errors", 0),
              "critical_throttled": rc.get("throttled", 0),
              "noisy_offered_tps": round(rn.get("n", 0) / rec_span, 1),
+             "noisy_accepted_tps": round(
+                 (rn.get("n", 0) - rn.get("throttled", 0)) / rec_span, 1),
              "noisy_ok_tps": round(rn.get("ok", 0) / rec_span, 1),
              "noisy_throttled": rn.get("throttled", 0),
              "client_cpu_pct": {ph: ps_all[ph]["_window"]["client_cpu_pct"]
@@ -696,23 +728,33 @@ res = results.write("TC2.5", "recovery observation under sustained throttling",
              "checks": {v["name"]: v["detail"] for v in verdicts["verdicts"]
                         if v["name"] in REC_CHECKS},
              "phase_aux": {p: aux_metrics(p) for p in PHASE_AUX}})
-viz.banner(st5, "TC2.5 recovery",
-           f"critical p95 {rc.get('p95', 0):.0f} ms (baseline "
-           f"{res['metrics']['baseline_p95']:.0f}); noisy still offering "
-           f"{rn.get('n', 0) / rec_span:.0f} req/s")
+pp = ps_all.get("post-baseline", {}).get("tenant-critical GET", {})
+rc_p95 = rc.get("p95", 0)
+v5 = next((v for v in verdicts["verdicts"]
+           if v["name"] == "recovery_improvement"), {})
+viz.banner(st5, "TC2.5 sustained enforcement",
+           f"during sustained enforcement: critical p95 {rc_p95:.0f} ms "
+           f"(baseline {res['metrics']['baseline_p95']:.0f}), noisy offered "
+           f"{rn.get('n', 0) / rec_span:.0f} req/s, "
+           f"{(rn.get('n', 0) - rn.get('throttled', 0)) / rec_span:.0f} "
+           f"accepted · post-baseline (noisy stopped): critical p95 "
+           f"{pp.get('p95', 0):.0f} ms"
+           + (f" · {v5.get('mode')}" if v5.get("mode") else ""))
 '''),
  notes("The mechanism is the already-running enforcement, observed longer "
        "— not a second action. recovery_improvement is the scored "
-       "isolation verdict; recovery_p95_vs_baseline is information only "
-       "because single-host CPU noise made it unfair."),
+       "isolation verdict (mode 'improvement' when contention was "
+       "measured, 'unaffected' when the critical workload never slowed); "
+       "recovery_p95_vs_baseline is information only because single-host "
+       "CPU noise made it unfair."),
  md("## Step 9 — Prefix-scoped rule (TC2.6)\n"
     "The second rule caps the noisy tenant at 10 TPS under "
-    "`demo-raw-covered/` only. Real traffic decides: one PUT burst to the "
-    "covered prefix and one to a control prefix (`<run_id>/curated/`). "
-    "PASS only if the covered prefix is held at its limit while the "
-    "control prefix runs clearly above it."),
+    "`demo-raw-covered/` only. The background noisy load is already "
+    "stopped (Step 8), so these bursts run alone. Real traffic decides: "
+    "one PUT burst to the covered prefix and one to a control prefix "
+    "(`<run_id>/curated/`). PASS only if the covered prefix is held at "
+    "its limit while the control prefix runs clearly above it."),
  py('''
-lg.pause_noisy(); time.sleep(3)
 lg.start_phase("prefix-test"); chart.mark("prefix bursts")
 cov = lg.noisy_burst(config.BUCKET_THROTTLE, COVERED, seconds=DUR["burst"], threads=4)
 ctl = lg.noisy_burst(config.BUCKET_THROTTLE, CONTROL, seconds=DUR["burst"], threads=4)
@@ -732,75 +774,116 @@ res = results.write("TC2.6", "prefix-scoped rule", status=pfx["status"], detail=
              "covered_codes": cov["codes"], "control_codes": ctl["codes"],
              **aux_metrics("prefix-test")})
 viz.banner(pfx["status"], "TC2.6 prefix rule", pfx["reason"])
-lg.resume_noisy()
 '''),
  notes("Both bursts use the tenant-noisy identity with retries off. The "
        "control prefix is still subject to the tenant-wide rule, so it is "
        "expected near 50 TPS, the covered prefix near 10."),
  md("## Step 10 — Spark write as the throttled tenant (TC2.7)\n"
-    "The same Spark job runs twice while the noisy load keeps the tenant at "
-    "its limit: first as **poc-admin** (not targeted by the rule), then — "
-    "in a session rebuilt with the **tenant-noisy** S3A identity — under "
-    "the enforced rule. PASS: the throttled job completes and throttling "
-    "was demonstrably active while it ran."),
+    "The same Spark job runs while the noisy load keeps the tenant at "
+    "its limit. One untimed warm-up write as **poc-admin** absorbs JVM "
+    "warm-up, then each identity is timed twice — poc-admin, "
+    "tenant-noisy, poc-admin, tenant-noisy — and the median of each is "
+    "reported. Job size is configurable: `SPARK_WRITE_ROWS` (default "
+    "200,000) and `SPARK_WRITE_PARTITIONS` (default 20); raise them until "
+    "the job's PUT rate exceeds the 50 TPS limit."),
  py('''
-lg.add_noisy(threads=6)
+import statistics
+lg.add_noisy(threads=config.NOISY_THREADS)
 lg.start_phase("spark-write"); chart.mark("spark writes")
 
-def spark_write(session, label):
-    target = f"{RID}/spark-write-{label}"
+ROWS_W = config.SPARK_WRITE_ROWS
+PARTS_W = config.SPARK_WRITE_PARTITIONS
+
+def spark_write(tag):
+    target = f"{RID}/spark-write-{tag}"
     t0 = time.time()
-    session.range(200_000).repartition(20).write.mode("overwrite").json(
+    spark.range(ROWS_W).repartition(PARTS_W).write.mode("overwrite").json(
         f"s3a://{config.BUCKET_THROTTLE}/{target}")
     return round(time.time() - t0, 1), target
 
-t_admin, _ = spark_write(spark, "admin")
-spark.stop()
-spark = sh.build_session("obs-poc-noisy", s3a_user="noisy")
-ident = sh.identities(spark)
+def rebuild(identity):
+    global spark
+    spark.stop()
+    spark = (sh.build_session("obs-poc") if identity == "admin"
+             else sh.build_session("obs-poc-noisy", s3a_user=identity))
+
+_wt, _ = spark_write("warmup-admin")
+print(f"warm-up write: {_wt}s (untimed)")
+
 t_start = time.time()
-try:
-    t_noisy, target = spark_write(spark, "noisy"); job_error = None
-except Exception as e:
-    t_noisy, target, job_error = None, f"{RID}/spark-write-noisy", str(e).splitlines()[0][:300]
+times = {"admin": [], "noisy": []}
+noisy_targets, idents, job_error = [], {}, None
+for i, ident in enumerate(["admin", "noisy", "admin", "noisy"]):
+    rebuild(ident)
+    idents[ident] = sh.identities(spark)
+    try:
+        t, tgt = spark_write(f"{ident}-{i}")
+        times[ident].append(t)
+        if ident == "noisy":
+            noisy_targets.append(tgt)
+    except Exception as e:
+        job_error = str(e).splitlines()[0][:300]
+        break
+
+t_admin = statistics.median(times["admin"]) if times["admin"] else None
+t_noisy = statistics.median(times["noisy"]) if times["noisy"] else None
 during = lg.snapshot(since=t_start).get("tenant-noisy", {}).get("PUT", {})
-s3a_stats = sh.s3a_committer_stats(config.BUCKET_THROTTLE, target) if not job_error else {}
-s3a_throttled = sum(v for k, v in s3a_stats.items()
-                    if "throttl" in k and isinstance(v, (int, float)))
+n429 = during.get("throttled", 0)
+s3a_stats, s3a_throttled = {}, 0
+for tgt in noisy_targets:
+    st = sh.s3a_committer_stats(config.BUCKET_THROTTLE, tgt)
+    s3a_stats[tgt] = st
+    s3a_throttled += sum(v for k, v in st.items()
+                         if "throttl" in k and isinstance(v, (int, float)))
 mode_now = thr.get_mode()
 aux = finish_phase("spark-write")
 if job_error:
     st7, why7 = "FAIL", f"Spark write as tenant-noisy failed: {job_error}"
-elif ident["s3a"] != "noisy":
-    st7, why7 = "FAIL", f"session S3A identity is {ident['s3a']}, not tenant-noisy"
-elif mode_now != "enabled" or not (during.get("throttled", 0) or s3a_throttled):
+elif idents.get("noisy", {}).get("s3a") != "noisy":
+    st7, why7 = "FAIL", (f"session S3A identity is "
+                         f"{(idents.get('noisy') or {}).get('s3a')}, not tenant-noisy")
+elif mode_now != "enabled" or not (n429 or s3a_throttled):
     st7, why7 = "INCONCLUSIVE", (f"job completed in {t_noisy}s, but no throttling was "
                                  f"observed for tenant-noisy while it ran (mode={mode_now})")
 elif contact_reason("spark-write"):
     st7, why7 = "FAIL", contact_reason("spark-write")
 else:
-    st7, why7 = "PASS", (f"completed under enforcement in {t_noisy}s vs {t_admin}s as "
-                         f"poc-admin ({t_noisy / max(t_admin, 0.1):.1f}x); "
-                         f"{during.get('throttled', 0)} tenant-noisy 429s during the job")
+    st7, why7 = "PASS", (f"median {t_noisy}s vs {t_admin}s as poc-admin "
+                         f"({t_noisy / max(t_admin or 0.1, 0.1):.1f}x); "
+                         f"{n429} tenant-noisy 429s during the job "
+                         f"(load generator + Spark)")
 res = results.write("TC2.7", "spark write as throttled tenant", status=st7, detail=why7,
-    metrics={"seconds_admin_unthrottled": t_admin, "seconds_noisy_throttled": t_noisy,
-             "slowdown": round(t_noisy / max(t_admin, 0.1), 2) if t_noisy else None,
-             "s3a_identity": ident["s3a"], "s3a_key": ident["s3a_key"],
+    metrics={"seconds_admin_runs": times["admin"],
+             "seconds_noisy_runs": times["noisy"],
+             "seconds_admin_median": t_admin, "seconds_noisy_median": t_noisy,
+             "slowdown": round(t_noisy / max(t_admin or 0.1, 0.1), 2)
+                        if t_noisy and t_admin else None,
+             "warmup_seconds": _wt,
+             "spark_write_rows": ROWS_W, "spark_write_partitions": PARTS_W,
+             "s3a_identity": (idents.get("noisy") or {}).get("s3a"),
+             "s3a_key": (idents.get("noisy") or {}).get("s3a_key"),
              "mode": mode_now,
-             "tenant_noisy_429_during_job": during.get("throttled", 0),
+             "tenant_noisy_429_during_job": n429,
              "tenant_noisy_ok_tps_during_job": round(
                  during.get("ok", 0) / max(1e-9, time.time() - t_start), 1),
              "s3a_committer_stats": s3a_stats,
+             "s3a_throttled_requests": s3a_throttled,
              **aux_metrics("spark-write")})
-viz.table(pd.DataFrame([{"identity": "poc-admin (not in the rule)", "seconds": t_admin},
-                        {"identity": "tenant-noisy (rule enforced)", "seconds": t_noisy}]))
+viz.table(pd.DataFrame([
+    {"identity": "poc-admin (not in the rule)", "runs_s": times["admin"],
+     "median_s": t_admin},
+    {"identity": "tenant-noisy (rule enforced)", "runs_s": times["noisy"],
+     "median_s": t_noisy}]))
 viz.banner(st7, "TC2.7 Spark under throttling", why7)
 '''),
  notes("The S3A identity is set per session (fs.s3a.access.key), verified "
-       "by build_session. S3A retries throttled requests "
+       "by build_session; each identity is rebuilt and timed twice, the "
+       "median reported. S3A retries throttled requests "
        "(fs.s3a.retry.throttle.*), so the job slows down instead of "
-       "failing. The 429 count is the tenant's LoadGen view during the "
-       "job; S3A's own counters are shown when the committer reports them."),
+       "failing. The 429 count is tenant-noisy 429s during the job from "
+       "the load generator plus Spark combined; Spark's own throttling "
+       "is only claimed when the S3A committer counters show it "
+       "(s3a_throttled_requests)."),
  md("## Step 11 — Stop the load: worker lifecycle (TC2.11)\n"
     "Stop and restart the noisy group once to prove it restarts safely, "
     "then stop every worker. lg.stop() also does the final remote flush so "

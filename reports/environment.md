@@ -237,7 +237,12 @@ The live chart used to rescan every recorded event on each redraw inside the
 load generator's process; it now keeps incremental per-bin state so a redraw
 does not stall the worker threads.
 
-### Paced recovery measurement (notebook 02 v2)
+### History: paced recovery measurement (notebook 02 v2 — superseded)
+
+> Historical: this section describes the earlier propagation /
+> pre-baseline / reference / enforced-24 flow. The current notebook 02 is
+> the six-phase flow (baseline → contention → simulation → enforced →
+> sustained enforcement → post-baseline); see the sections below.
 
 Critical GETs are now open-loop paced (`CRITICAL_RATE`, default 100 req/s, 4
 threads) instead of 2 threads as fast as possible (≈570 GET/s), and latency is

@@ -6,6 +6,11 @@ Wants=network-online.target
 # Runs on the second client host only. It holds ONLY the tenant-noisy keys —
 # no admin/root/critical/table credentials. One-time host preparation:
 # README.md, "Remote noisy agent (U02)".
+#
+# The agent's control plane is plain HTTP: X-POC-Token travels unencrypted
+# on the LAN. Mitigations (README): firewall port 8765 to U01 only, a random
+# token in 0600 env files, explicit NOISY_AGENT_BIND (the agent refuses to
+# start without one). Put the agent behind TLS for non-lab use.
 [Service]
 Type=simple
 User=poc
