@@ -381,3 +381,22 @@ simple.
   open-loop with missed-slot tracking; `0` = as fast as possible). The lab
   validation for this change used `CRITICAL_RATE=0` (unpaced) per operator
   request, so the paced-client guard is omitted on those runs.
+
+### V4 tuning run — contention made visible (demo-tuning-1)
+
+Settings: `NOISY_OBJECT_KB=1024 PAYLOAD_RANDOM=1 NOISY_THREADS=12
+CRITICAL_OBJECTS=1000` (1 MiB uncompressible PUTs, 12 noisy threads on U02,
+critical reads spread over 1000 seed objects). This is the first tested
+load that measurably contended with the critical tenant:
+
+- baseline critical p95 13.6 ms → contention 28.2 ms (+15 ms, TC2.3 PASS
+  with "+15 ms measured impact"); noisy offered 146 PUT/s.
+- enforced: accepted 45.8 PUT/s vs 50 TPS limit, 2005 429s; critical p95
+  27.4 ms. Sustained enforcement: 18.4 ms.
+- `recovery_improvement` PASS on the **improvement** branch: share=0.67
+  (throttling removed ~2/3 of the contention latency). All other verdicts
+  PASS; throttler restored (TC2.8 PASS).
+
+Note: 50 TPS of 1 MiB PUTs ≈ 50 MB/s offered — at this object size the TPS
+limit is also a bandwidth limit (~46 MB/s accepted). Defaults remain the
+validated 64 KiB / 6-thread / 1-object settings.
