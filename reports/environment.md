@@ -400,3 +400,23 @@ load that measurably contended with the critical tenant:
 Note: 50 TPS of 1 MiB PUTs ≈ 50 MB/s offered — at this object size the TPS
 limit is also a bandwidth limit (~46 MB/s accepted). Defaults remain the
 validated 64 KiB / 6-thread / 1-object settings.
+
+### V4 re-validation — default remote run (demo-v4-default2)
+
+Remote mode, committed defaults (`CRITICAL_RATE=0`, 64 KiB noisy PUTs,
+6 threads, 1 critical seed object). All TC2.x PASS; TC2.8 restore PASS.
+
+- `recovery_improvement` PASS via **unaffected**: contention +0.1 ms;
+  recovery p95 = baseline. `baseline_stable` PASS; TC2.9 overall PASS.
+- post-baseline p95 = 13.7 ms (baseline 13.7 ms).
+- Critical p95 per 10 s bucket, contention start → post-baseline end
+  (full series in TC2.9 `critical_p95_10s`): flat 11–21 ms throughout —
+  0:13.6 10:13.3 20:15.0 30:13.4 40:15.0 50:15.0 60:17.3 70:13.2
+  80:15.0 90:15.0 100:14.1 110:15.9 120:14.9 130:12.3 140:11.6
+  150:11.8 160:12.0 170:14.0 180:15.3 190:14.9 200:12.7 210:13.9
+  220:13.6 230:16.1 240:14.5 250:17.0 260:12.7 270:16.9 280:13.8
+  290:17.3 300:14.4 310:20.6 320:17.6 330:13.9 340:12.4 350:14.6
+  360:12.5 370:15.0 380:14.2 390:13.0 400:11.5 410:13.6 420:13.2
+  430:16.8 — no contention at any point; ObjectScale isolated the tenants.
+- TC2.7: median 186.5 s vs 31.25 s as poc-admin (6.0x); 8,804 tenant-noisy
+  429s during the job (load generator + Spark).
