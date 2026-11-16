@@ -410,6 +410,23 @@ def aux_metrics(name):
             "remote_pull": a.get("remote"),
             "max_outage_s": a.get("max_outage_s"),
             "contact_ok": a.get("contact_ok")}
+
+def crit_p95_buckets(bucket_s=10):
+    """Critical-GET p95 per `bucket_s` seconds from the contention start
+    through the post-baseline end — shows where in the run latency moves."""
+    import poc.loadgen as _lg
+    phs = {p["name"]: p for p in getattr(lg, "phases", [])}
+    a, b = phs.get("contention"), phs.get("post-baseline")
+    if not a or not b:
+        return []
+    t0, t1 = a["start"], b["end"]
+    buckets = {}
+    for ts, lat in lg.critical_get_series():
+        if t0 <= ts <= t1:
+            buckets.setdefault(int((ts - t0) // bucket_s), []).append(lat)
+    return [{"offset_s": k * bucket_s, "n": len(v),
+             "p95_ms": round(_lg.pctile(v, 95), 1)}
+            for k, v in sorted(buckets.items())]
 '''),
  notes("Shared namespace bucket, separate principals — that is what "
        "principal-scoped rules discriminate on. LoadGen talks to S3 with "
@@ -938,7 +955,11 @@ res = results.write("TC2.9", "verdicts + correlation", status=verdicts["overall"
                              "verdicts": rows, **corr,
                              "clock_offsets": {p: a.get("clock_offset_ms")
                                                for p, a in PHASE_AUX.items()},
-                             "contact_failures": contact_fails})
+                             "contact_failures": contact_fails,
+                             "critical_p95_10s": crit_p95_buckets(),
+                             "post_baseline_p95": round(ps_all.get(
+                                 "post-baseline", {}).get(
+                                 "tenant-critical GET", {}).get("p95", 0), 1)})
 viz.banner(verdicts["overall"], "TC2.9 overall verdict",
            f"enforcement mode: {verdicts['enforcement_mode']}")
 '''),

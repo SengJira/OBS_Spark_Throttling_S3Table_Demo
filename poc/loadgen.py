@@ -403,6 +403,18 @@ class LoadGen:
                         **groups}
         return out
 
+    def critical_get_series(self):
+        """[(ts, lat_ms)] of every ok critical GET across all phases —
+        survives the chart event buffer's maxlen, for bucketed analysis."""
+        with self._lock:
+            out = []
+            for groups in self._agg_buf.values():
+                for ts, lat, status, code, _r in \
+                        groups.get("tenant-critical GET", []):
+                    if classify(status, code) == "ok":
+                        out.append((ts, lat))
+            return sorted(out)
+
     def phase_window(self, name):
         """(start, end) of the most recent phase called `name`; end is now
         for the still-open phase."""

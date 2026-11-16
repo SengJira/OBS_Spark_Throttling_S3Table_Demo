@@ -9,6 +9,7 @@ pulls events back; phase attribution stays on U01 by request-start timestamp.
 
 Run as a service:  python -m poc.noisy_agent   (see systemd/noisy-agent.service)
 """
+import collections
 import hmac
 import json
 import logging
@@ -35,11 +36,19 @@ class AgentState:
         self.idle_stopped = False
         self.watchdog_stop = threading.Event()
         self.event_seq = 0
-        self.event_log = {}              # seq -> rec, bounded (V4-6)
+        self.event_log = collections.deque()  # seq-ordered, trimmed on pull
         self.event_dropped = 0
         self.MAX_EVENTS = 500000
         self._key_gens = {}              # run_id -> generation (V4-8)
         self.event_lock = threading.Lock()
+
+    def _reset_events(self):
+        """New run_id: drop all retained events and restart the sequence so
+        U01's fresh cursor lines up with the agent's."""
+        with self.event_lock:
+            self.event_seq = 0
+            self.event_log.clear()
+            self.event_dropped = 0
 
     def _next_key_gen(self, run_id):
         g = self._key_gens.get(run_id, 0) + 1
@@ -53,20 +62,25 @@ class AgentState:
         with self.event_lock:
             self.event_seq += 1
             rec["seq"] = self.event_seq
-            self.event_log[self.event_seq] = rec
-            over = len(self.event_log) - self.MAX_EVENTS
-            if over > 0:
-                for s in sorted(self.event_log)[:over]:
-                    del self.event_log[s]
-                    self.event_dropped += 1
+            self.event_log.append(rec)
+            while len(self.event_log) > self.MAX_EVENTS:
+                self.event_log.popleft()
+                self.event_dropped += 1
 
     def events_since(self, since):
+        """Events with seq > `since`, the current cursor, the oldest
+        retained seq and the drop counter. Once events are pulled they are
+        never needed again, so everything up to the returned cursor is
+        trimmed — the log only holds events not yet pulled."""
         with self.event_lock:
             start = max(0, int(since))
-            evs = [self.event_log[s] for s in sorted(self.event_log)
-                   if s > start]
-            first = min(self.event_log) if self.event_log else self.event_seq + 1
-            return evs, self.event_seq, first, self.event_dropped
+            evs = [e for e in self.event_log if e["seq"] > start]
+            cur = self.event_seq
+            first = (self.event_log[0]["seq"] if self.event_log
+                     else self.event_seq + 1)
+            while self.event_log and self.event_log[0]["seq"] <= cur:
+                self.event_log.popleft()
+            return evs, cur, first, self.event_dropped
 
     def inflight_info(self):
         if self.lg is None:
@@ -109,6 +123,9 @@ class AgentState:
                 if old_run == run_id:
                     return self.lg       # same run: reuse the live generator
                 self.lg.stop_noisy()     # different run: never reuse it
+            old_run = (self.params or {}).get("run_id")
+            if old_run is not None and old_run != run_id:
+                self._reset_events()      # new run: fresh event sequence
             self.lg = loadgen.LoadGen(run_id=params["run_id"],
                                       bucket=params["bucket"],
                                       max_keys=params["max_keys"],
@@ -239,7 +256,7 @@ class Handler(BaseHTTPRequestHandler):
                             "noisy": state.noisy_status(),
                             "s3": state.s3_status()})
             elif path == "/status":
-                first = (min(state.event_log) if state.event_log
+                first = (state.event_log[0]["seq"] if state.event_log
                          else state.event_seq + 1)
                 self._json({"ok": True, "agent_time": time.time(),
                             "event_cursor": state.event_seq,

@@ -247,3 +247,51 @@ def test_key_gen_increments_per_run_id():
     assert st._next_key_gen("r1") == 2
     assert st._next_key_gen("r2") == 1
     assert st._next_key_gen("r1") == 3
+
+
+def test_event_log_trims_pulled_events():
+    """V4-6: once events are pulled the log keeps only unpulled events."""
+    import types
+    st = noisy_agent.AgentState(token="t", idle_s=3600)
+    ev = types.SimpleNamespace(ts=1.0, tenant="tenant-noisy", op="PUT",
+                               lat_ms=1.0, status="ok", code=None,
+                               retries=0, phase=None)
+    for _ in range(10):
+        st._on_event(ev)
+    evs, cur, first, dropped = st.events_since(0)
+    assert len(evs) == 10 and cur == 10
+    assert first == 1 and dropped == 0
+    # everything pulled -> log is empty; a new event starts a fresh window
+    evs2, cur2, first2, _ = st.events_since(cur)
+    assert evs2 == [] and cur2 == 10 and first2 == 11
+    assert len(st.event_log) == 0
+
+
+def test_event_log_1m_events_stays_fast():
+    """V4-6: 1M events through the deque log with cap + pull stays fast."""
+    import types
+    st = noisy_agent.AgentState(token="t", idle_s=3600)
+    st.MAX_EVENTS = 500000
+    ev = types.SimpleNamespace(ts=1.0, tenant="tenant-noisy", op="PUT",
+                               lat_ms=1.0, status="ok", code=None,
+                               retries=0, phase=None)
+    t0 = time.time()
+    for _ in range(1_000_000):
+        st._on_event(ev)
+    evs, cur, first, dropped = st.events_since(0)
+    assert cur == 1_000_000 and dropped == 500_000 and first == 500001
+    assert len(evs) == 500000
+    # second pull is trivial
+    evs2, cur2, first2, _ = st.events_since(cur)
+    assert evs2 == [] and first2 == 1_000_001
+    assert time.time() - t0 < 15
+
+
+def test_event_log_resets_on_new_run_id():
+    st = noisy_agent.AgentState(token="t", idle_s=3600)
+    st.params = {"run_id": "run-a"}
+    st.event_seq = 42
+    st.event_log.append({"seq": 42})
+    st.ensure_lg({"run_id": "run-b"})
+    assert st.event_seq == 0 and len(st.event_log) == 0
+    assert st.event_dropped == 0
