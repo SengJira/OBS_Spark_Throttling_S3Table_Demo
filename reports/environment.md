@@ -420,3 +420,32 @@ Remote mode, committed defaults (`CRITICAL_RATE=0`, 64 KiB noisy PUTs,
   430:16.8 — no contention at any point; ObjectScale isolated the tenants.
 - TC2.7: median 186.5 s vs 31.25 s as poc-admin (6.0x); 8,804 tenant-noisy
   429s during the job (load generator + Spark).
+
+### V4-5 tuning repeats — demo-tuning-2 and demo-tuning-3
+
+Same settings both runs: `NOISY_OBJECT_KB=1024 PAYLOAD_RANDOM=1
+NOISY_THREADS=12 CRITICAL_OBJECTS=1000`. All TC2.x PASS; TC2.8 restore
+PASS after each. Full 10 s bucket series are in each run's TC2.9
+`critical_p95_10s` metric.
+
+**demo-tuning-2** — post-baseline p95 **16.4 ms** (baseline 14.3).
+ contention p95 32.2 ms (+18 ms measured, 133 noisy PUT/s). Enforced
+ phase critical p95 19.4 ms; sustained enforcement 18.3 ms.
+ `recovery_improvement` PASS (improvement): **share=0.78**.
+ Buckets: ~26–66 ms through contention/simulation/switching, falling to
+ ~17–21 ms from the enforced phase onward — recovery happened **during
+ "enforced"**; sustained enforcement only confirmed it holds.
+
+**demo-tuning-3** — post-baseline p95 **14.5 ms** (baseline 14.2).
+ contention p95 28.0 ms (+14 ms measured, 155 noisy PUT/s). Enforced
+ phase critical p95 19.5 ms; sustained enforcement 18.2 ms.
+ `recovery_improvement` PASS (improvement): **share=0.71**.
+ Buckets: ~26–51 ms through contention/simulation/switching, dropping to
+ ~17–21 ms at the enforced phase — again recovery during **"enforced"**.
+ (The earlier demo-tuning-1 run was the exception: enforced p95 was still
+ 27.4 ms and recovery completed in sustained enforcement, 18.4 ms.)
+
+Across three tuning runs the improvement-branch share was 0.67 / 0.78 /
+0.71 — the throttler consistently removes roughly two-thirds to three-
+quarters of the contention latency once the noisy tenant is capped at
+50 PUT/s (~46–50 MB/s at 1 MiB objects).
