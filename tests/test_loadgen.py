@@ -765,8 +765,34 @@ def test_evaluate_drift_makes_recovery_inconclusive():
     out = throttle_eval.evaluate(st, rule=RULE)
     names = {v["name"]: v["verdict"] for v in out["verdicts"]}
     assert names["baseline_stable"] == "FAIL"
-    assert names["recovery_vs_reference"] == "INCONCLUSIVE"
+    assert names["recovery_improvement"] == "INCONCLUSIVE"
+    assert names["critical_p95_within_sla"] == "INCONCLUSIVE"
     assert out["overall"] == "FAIL"
+
+
+def test_evaluate_recovery_improvement_pass():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["recovery_improvement"] == "PASS"
+
+
+def test_evaluate_recovery_improvement_fail():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=28, base_p95=9)
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["recovery_improvement"] == "FAIL"
+
+
+def test_evaluate_no_contention_is_inconclusive():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    st["contention"]["tenant-critical GET"]["p95"] = 10
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["recovery_improvement"] == "INCONCLUSIVE"
 
 
 def test_evaluate_paced_client_misses_are_inconclusive():
