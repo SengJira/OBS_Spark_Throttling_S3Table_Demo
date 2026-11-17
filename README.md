@@ -45,6 +45,9 @@ output-free), the report in `reports/PoC_Report.html`. Or run in JupyterLab:
 | `PAYLOAD_RANDOM` | `0` | `1` = random (uncompressible) bytes per worker |
 | `CRITICAL_OBJECTS` | `1` | seed objects critical GETs read at random |
 | `CRITICAL_OBJECT_KB` | `64` | KiB per critical seed object |
+| `SPARK_WRITE_ROWS` | `50000` | rows in the TC2.7 Spark write job |
+| `SPARK_WRITE_PARTITIONS` | `4` | output files — each costs several PUTs under the magic committer |
+| `SPARK_WRITE_REPEATS` | `1` | admin/noisy write pairs; `>1` reports the median |
 | `POC_RUN_ID` | `demo-<timestamp>` | one run ID for the whole suite |
 | `NOISY_HOST` | empty | `host:port` of `poc/noisy_agent.py` on the second client host; empty keeps noisy PUTs local on U01 |
 | `NOISY_AGENT_TOKEN` | empty | shared `X-POC-Token` header for U01 ↔ U02 control traffic |
@@ -52,7 +55,7 @@ output-free), the report in `reports/PoC_Report.html`. Or run in JupyterLab:
 Approximate run time at the defaults (2-vCPU lab host): `99_reset` 1–3 min,
 `00` 0.5 min, `01` ≈ 3 min, `02` ≈ 12 min (60 s baseline + 60 s contention +
 60 s dry-run + mode switch + 120 s enforced + 60 s recovery + 60 s
-post-baseline + prefix bursts + two Spark writes), `03` ≈ 3 min,
+post-baseline + prefix bursts + one admin/noisy Spark write pair), `03` ≈ 3 min,
 `04` < 0.5 min — **≈ 22 min in total**.
 
 Run `99_reset` at least **5 minutes** before notebook 02: it stages the two
