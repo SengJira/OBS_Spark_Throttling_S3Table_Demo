@@ -449,3 +449,29 @@ Across three tuning runs the improvement-branch share was 0.67 / 0.78 /
 0.71 — the throttler consistently removes roughly two-thirds to three-
 quarters of the contention latency once the noisy tenant is capped at
 50 PUT/s (~46–50 MB/s at 1 MiB objects).
+
+### TC2.7 speed-up — single-session Spark write (demo-20261116-193249)
+
+Remote mode, committed defaults (`SPARK_WRITE_ROWS=50000`,
+`SPARK_WRITE_PARTITIONS=4`, `SPARK_WRITE_REPEATS=1`). Notebook 02 Step 1
+now builds the Spark session once with per-bucket S3A credentials
+(`fs.s3a.bucket.<bucket>.*`): `poc-spark-data` → poc-admin,
+`poc-throttle` → tenant-noisy. Step 10 has no `spark.stop()`/session
+rebuilds; the warm-up is a tiny untimed `spark.range(1000).coalesce(1)`
+write that only loads JVM classes and S3A.
+
+- Step 10 wall time (`step_seconds` metric): **100.8 s** — versus
+  ≈ 8–9 min before (warm-up + four full-size writes + four session
+  rebuilds). Target of ≈ 2 min met.
+- Timed writes: poc-admin **8.5 s** vs tenant-noisy **63.6 s** →
+  **7.5× slowdown** (`slowdown=7.48`).
+- 1,453 tenant-noisy 429s during the job window (load generator +
+  Spark); `bucket_identities` confirmed `poc-throttle → tenant-noisy`,
+  `poc-spark-data → admin`; throttler mode=enabled; no write errors.
+- `s3a_throttled_requests=0` — Spark's own S3A throttling counters showed
+  none, so the PASS rests on the observed tenant-noisy 429s (the banner
+  says "load generator + Spark" honestly).
+- TC2.7 **PASS**; every other TC2.x **PASS**; TC2.8 restore **PASS** —
+  live throttler state equals `reports/throttle_backup.json`
+  (disabled / 503 / 0 rules).
+- Whole notebook 02 ≈ 11.3 min wall time (nbconvert, remote mode).
