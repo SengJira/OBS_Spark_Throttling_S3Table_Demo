@@ -264,7 +264,8 @@ import poc.spark_helpers as sh
 _old = globals().get("_POC_LG")
 if _old is not None:
     _old.stop()
-spark = sh.build_session("obs-poc")
+spark = sh.build_session("obs-poc", bucket_users={
+    config.BUCKET_DATA: "admin", config.BUCKET_THROTTLE: "noisy"})
 viz.table(pd.DataFrame(sh.versions(spark).items(), columns=["component", "version"]))
 
 PHASE_S = int(os.environ.get("THROTTLE_PHASE_S", "60"))
@@ -797,53 +798,33 @@ viz.banner(pfx["status"], "TC2.6 prefix rule", pfx["reason"])
        "expected near 50 TPS, the covered prefix near 10."),
  md("## Step 10 — Spark write as the throttled tenant (TC2.7)\n"
     "The same Spark job runs while the noisy load keeps the tenant at "
-    "its limit. One untimed warm-up write as **poc-admin** absorbs JVM "
-    "warm-up, then each identity is timed twice — poc-admin, "
-    "tenant-noisy, poc-admin, tenant-noisy — and the median of each is "
-    "reported. Job size is configurable: `SPARK_WRITE_ROWS` (default "
-    "200,000) and `SPARK_WRITE_PARTITIONS` (default 20); raise them until "
-    "the job's PUT rate exceeds the 50 TPS limit."),
+    "its limit — in **one session**: S3A per-bucket credentials make "
+    "`poc-spark-data` poc-admin and `poc-throttle` tenant-noisy (set in "
+    "Step 1), so no session rebuilds are needed. A tiny untimed warm-up "
+    "write loads the JVM classes and S3A, then the poc-admin / "
+    "tenant-noisy pair runs `SPARK_WRITE_REPEATS` times (default 1) and "
+    "the median is reported. Job size: `SPARK_WRITE_ROWS` (default "
+    "50,000) and `SPARK_WRITE_PARTITIONS` (default 4) — each output file "
+    "costs several PUTs with the magic committer, so raise PARTITIONS "
+    "for a bigger throttling effect (the step takes longer)."),
  py('''
 import statistics
+t_step = time.time()
 lg.add_noisy(threads=config.NOISY_THREADS)
 lg.start_phase("spark-write"); chart.mark("spark writes")
 
 ROWS_W = config.SPARK_WRITE_ROWS
 PARTS_W = config.SPARK_WRITE_PARTITIONS
-
-def spark_write(tag):
-    target = f"{RID}/spark-write-{tag}"
-    t0 = time.time()
-    spark.range(ROWS_W).repartition(PARTS_W).write.mode("overwrite").json(
-        f"s3a://{config.BUCKET_THROTTLE}/{target}")
-    return round(time.time() - t0, 1), target
-
-def rebuild(identity):
-    global spark
-    spark.stop()
-    spark = (sh.build_session("obs-poc") if identity == "admin"
-             else sh.build_session("obs-poc-noisy", s3a_user=identity))
-
-_wt, _ = spark_write("warmup-admin")
-print(f"warm-up write: {_wt}s (untimed)")
-
-t_start = time.time()
-times = {"admin": [], "noisy": []}
-noisy_targets, idents, job_error = [], {}, None
-for i, ident in enumerate(["admin", "noisy", "admin", "noisy"]):
-    rebuild(ident)
-    idents[ident] = sh.identities(spark)
-    try:
-        t, tgt = spark_write(f"{ident}-{i}")
-        times[ident].append(t)
-        if ident == "noisy":
-            noisy_targets.append(tgt)
-    except Exception as e:
-        job_error = str(e).splitlines()[0][:300]
-        break
+REPEATS = max(1, config.SPARK_WRITE_REPEATS)
+times, targets, t_start, write_errors = sh.benchmark_writes(
+    spark, RID, [("admin", config.BUCKET_DATA),
+                 ("noisy", config.BUCKET_THROTTLE)],
+    ROWS_W, PARTS_W, repeats=REPEATS, warmup_bucket=config.BUCKET_DATA)
+step_seconds = round(time.time() - t_step, 1)
 
 t_admin = statistics.median(times["admin"]) if times["admin"] else None
 t_noisy = statistics.median(times["noisy"]) if times["noisy"] else None
+noisy_targets = [t for label, t in targets if label == "noisy"]
 during = lg.snapshot(since=t_start).get("tenant-noisy", {}).get("PUT", {})
 n429 = during.get("throttled", 0)
 s3a_stats, s3a_throttled = {}, 0
@@ -853,12 +834,20 @@ for tgt in noisy_targets:
     s3a_throttled += sum(v for k, v in st.items()
                          if "throttl" in k and isinstance(v, (int, float)))
 mode_now = thr.get_mode()
+bids = sh.bucket_identities(
+    spark, [config.BUCKET_DATA, config.BUCKET_THROTTLE])
 aux = finish_phase("spark-write")
-if job_error:
-    st7, why7 = "FAIL", f"Spark write as tenant-noisy failed: {job_error}"
-elif idents.get("noisy", {}).get("s3a") != "noisy":
-    st7, why7 = "FAIL", (f"session S3A identity is "
-                         f"{(idents.get('noisy') or {}).get('s3a')}, not tenant-noisy")
+if write_errors:
+    e0 = write_errors[0]
+    st7, why7 = "FAIL", (f"Spark write as {e0['label']} failed: "
+                         f"{e0['error']}")
+elif not times["noisy"] or not times["admin"]:
+    st7, why7 = "FAIL", ("Spark write runs incomplete: "
+                         f"admin={len(times['admin'])}, "
+                         f"noisy={len(times['noisy'])}")
+elif bids.get(config.BUCKET_THROTTLE) != "noisy":
+    st7, why7 = "FAIL", (f"poc-throttle S3A identity is "
+                         f"{bids.get(config.BUCKET_THROTTLE)}, not tenant-noisy")
 elif mode_now != "enabled" or not (n429 or s3a_throttled):
     st7, why7 = "INCONCLUSIVE", (f"job completed in {t_noisy}s, but no throttling was "
                                  f"observed for tenant-noisy while it ran (mode={mode_now})")
@@ -875,10 +864,11 @@ res = results.write("TC2.7", "spark write as throttled tenant", status=st7, deta
              "seconds_admin_median": t_admin, "seconds_noisy_median": t_noisy,
              "slowdown": round(t_noisy / max(t_admin or 0.1, 0.1), 2)
                         if t_noisy and t_admin else None,
-             "warmup_seconds": _wt,
+             "step_seconds": step_seconds,
              "spark_write_rows": ROWS_W, "spark_write_partitions": PARTS_W,
-             "s3a_identity": (idents.get("noisy") or {}).get("s3a"),
-             "s3a_key": (idents.get("noisy") or {}).get("s3a_key"),
+             "spark_write_repeats": REPEATS,
+             "write_errors": write_errors or None,
+             "bucket_identities": bids,
              "mode": mode_now,
              "tenant_noisy_429_during_job": n429,
              "tenant_noisy_ok_tps_during_job": round(
@@ -893,14 +883,19 @@ viz.table(pd.DataFrame([
      "median_s": t_noisy}]))
 viz.banner(st7, "TC2.7 Spark under throttling", why7)
 '''),
- notes("The S3A identity is set per session (fs.s3a.access.key), verified "
-       "by build_session; each identity is rebuilt and timed twice, the "
-       "median reported. S3A retries throttled requests "
-       "(fs.s3a.retry.throttle.*), so the job slows down instead of "
-       "failing. The 429 count is tenant-noisy 429s during the job from "
-       "the load generator plus Spark combined; Spark's own throttling "
-       "is only claimed when the S3A committer counters show it "
-       "(s3a_throttled_requests)."),
+ notes("One session, two identities: fs.s3a.bucket.<bucket>.access.key "
+       "credentials set in Step 1 make poc-spark-data poc-admin and "
+       "poc-throttle tenant-noisy — verified per bucket by "
+       "bucket_identities before the verdict. SPARK_WRITE_REPEATS>1 "
+       "repeats the admin/noisy pair and reports the median. The warm-up "
+       "is a tiny untimed write that only loads JVM classes and S3A. "
+       "S3A retries throttled requests (fs.s3a.retry.throttle.*), so the "
+       "job slows down instead of failing. The 429 count is tenant-noisy "
+       "429s during the job from the load generator plus Spark combined; "
+       "Spark's own throttling is only claimed when the S3A committer "
+       "counters show it (s3a_throttled_requests). Raise "
+       "SPARK_WRITE_PARTITIONS for a bigger effect; the step takes "
+       "longer."),
  md("## Step 11 — Stop the load: worker lifecycle (TC2.11)\n"
     "Stop and restart the noisy group once to prove it restarts safely, "
     "then stop every worker. lg.stop() also does the final remote flush so "
