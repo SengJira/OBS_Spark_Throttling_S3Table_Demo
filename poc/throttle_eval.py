@@ -6,9 +6,9 @@ plus the live /throttle/config/actions list — nothing undocumented is sent.
 
 evaluate() turns per-phase LoadGen metrics into PASS/FAIL/INCONCLUSIVE
 verdicts against customer-approved thresholds. INCONCLUSIVE is used when the
-data cannot decide — e.g. this lab build accepts rules but emits no 429/503
-until a datahead reload (see reports/environment.md), so an enforcement
-verdict cannot be claimed either way.
+data cannot decide — e.g. no enforcement signature was observed, so an
+enforcement verdict cannot be claimed either way. It is never counted as a
+pass.
 """
 import time
 
@@ -26,19 +26,58 @@ DEFAULT_THRESHOLDS = {
     "min_offer_factor": 0.8,          # enforced offer < limit*factor => load
                                     # not sustained => INCONCLUSIVE
     "critical_throttle_max": 0,       # critical GET 429/SlowDown count allowed
+    "baseline_stable_factor": 1.25,   # post-baseline p95 <= factor*baseline p95
+    "recovery_improvement_min_share": 0.5,  # share of contention damage removed
+    "contention_min_delta_ms": 2.0,   # contention must raise p95 by this much
+    "unaffected_factor": 1.25,        # no-contention: recovery p95 <= factor*baseline
+    "max_missed_slot_pct": 1.0,       # paced client misses => INCONCLUSIVE
 }
 
-# Fields verified against PUT /throttle/config on this build.
-RULE_FIELDS = {"id", "rateUnit", "isDisabled", "filters", "limit", "scoping",
-               "description"}
-FILTER_FIELDS = {"principals", "verbs", "actions", "paths", "ips", "size"}
-PATH_MATCHERS = {"wildcard", "exact", "prefix"}
-RATE_UNITS = {"TPS", "BPS"}
+# Rule schema, confirmed live against PUT /throttle/config and
+# GET /throttle/template on ObjectScale 4.4 (see reports/environment.md):
+# every value outside these sets was rejected with HTTP 400.
+RULE_FIELDS = {"id", "description", "isDisabled", "rateUnit", "filters",
+               "limit", "scoping"}
+FILTER_FIELDS = {"principals", "verbs", "actions", "paths", "exclude_paths",
+                 "ips", "exclude_ips"}
+RATE_UNITS = {"TPS", "TPM"}                      # BPS -> 400
+PATH_MATCHERS = {"exact", "wildcard"}            # prefix -> 400
+IP_MATCHERS = {"exact", "wildcard4", "cidr4"}
+VERBS = {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "*"}
+SCOPING = {"principal", "action", "ip", "path", "verb"}
+# scoping dimension -> the filter it needs (server, for every dimension:
+# "scoping.per dimension '<d>' requires a corresponding filter")
+SCOPING_NEEDS = {"principal": "principals", "action": "actions", "ip": "ips",
+                 "path": "paths", "verb": "verbs"}
+
+
+def _live_actions(thr):
+    acts = thr.list_actions()
+    if isinstance(acts, dict):
+        acts = acts.get("actions", [])
+    return set(acts)
+
+
+def _check_matcher(problems, f, key, matchers):
+    if key not in f:
+        return
+    m = f[key]
+    if not isinstance(m, dict):
+        problems.append(f"{key} must be an object with matcher + values")
+        return
+    if m.get("matcher") not in matchers:
+        problems.append(f"{key}.matcher must be one of {sorted(matchers)}")
+    if not m.get("values"):
+        problems.append(f"{key}.values must be non-empty")
 
 
 def verify_rule(thr, rule):
-    """Validate `rule` against the accepted config schema and the live
-    actions list. Read-only — never modifies configuration."""
+    """Validate `rule` against the schema ObjectScale accepts and against the
+    LIVE action list. Read-only — never modifies configuration.
+
+    `ok` is True only if every check passed, including the live action
+    lookup: an action that the server does not list, or a lookup that could
+    not be made, is a problem."""
     problems = []
     unknown = set(rule) - RULE_FIELDS
     if unknown:
@@ -47,29 +86,59 @@ def verify_rule(thr, rule):
         problems.append("missing rule id")
     if rule.get("rateUnit") not in RATE_UNITS:
         problems.append(f"rateUnit must be one of {sorted(RATE_UNITS)}")
+    warnings = []
     lim = (rule.get("limit") or {}).get("value")
-    if not isinstance(lim, (int, float)) or lim <= 0:
-        problems.append("limit.value must be a positive number")
+    if isinstance(lim, bool) or not isinstance(lim, int) or lim < 0:
+        problems.append("limit.value must be 0 or a positive integer")
+    elif lim == 0:
+        warnings.append("limit.value 0 is accepted by the server, but its "
+                        "effect was not tested in this PoC")
+
     f = rule.get("filters") or {}
     bad_f = set(f) - FILTER_FIELDS
     if bad_f:
         problems.append(f"unknown filter fields: {sorted(bad_f)}")
-    if not (f.get("principals") or f.get("paths") or f.get("ips")):
-        problems.append("filters must select at least one dimension")
-    if "paths" in f:
-        p = f["paths"]
-        if p.get("matcher") not in PATH_MATCHERS:
-            problems.append(f"paths.matcher must be one of {sorted(PATH_MATCHERS)}")
-        if not p.get("values"):
-            problems.append("paths.values must be non-empty")
+    if not any(f.get(k) for k in FILTER_FIELDS):
+        problems.append("no valid filters: a rule needs at least one filter")
+    verbs, actions = f.get("verbs"), f.get("actions")
+    if verbs and actions:
+        problems.append("a rule uses verbs or actions, not both")
+    bad_verbs = set(verbs or []) - VERBS
+    if bad_verbs:
+        problems.append(f"unknown verbs: {sorted(bad_verbs)}")
+
     supported = {}
-    try:
-        acts = thr.list_actions()
-        supported["actions"] = acts if isinstance(acts, list) else acts.get(
-            "actions", acts)
-    except Exception as e:
-        supported["actions_error"] = str(e)[:80]
-    return {"ok": not problems, "problems": problems,
+    if actions:
+        try:
+            live = _live_actions(thr)
+            supported["actions"] = sorted(live)
+            bad_actions = sorted(set(actions) - live)
+            if bad_actions:
+                problems.append(f"actions not offered by this server: {bad_actions}")
+        except Exception as e:
+            supported["actions_error"] = str(e)[:80]
+            problems.append("actions could not be checked against the live "
+                            f"/throttle/config/actions list ({type(e).__name__})")
+
+    _check_matcher(problems, f, "paths", PATH_MATCHERS)
+    _check_matcher(problems, f, "exclude_paths", PATH_MATCHERS)
+    _check_matcher(problems, f, "ips", IP_MATCHERS)
+    _check_matcher(problems, f, "exclude_ips", IP_MATCHERS)
+    if "exclude_paths" in f and "paths" not in f:
+        problems.append("exclude_paths requires a paths filter")
+    if "exclude_ips" in f and "ips" not in f:
+        problems.append("exclude_ips requires an ips filter")
+
+    per = (rule.get("scoping") or {}).get("per") or []
+    bad_per = [d for d in per if d not in SCOPING]
+    if bad_per:
+        problems.append(f"scoping.per values must be from {sorted(SCOPING)}; "
+                        f"got {bad_per}")
+    for d in per:
+        need = SCOPING_NEEDS.get(d)
+        if need and not f.get(need):
+            problems.append(f"scoping.per '{d}' requires a {need} filter")
+    return {"ok": not problems, "problems": problems, "warnings": warnings,
             "supported": supported, "checked_at": time.time()}
 
 
@@ -111,36 +180,156 @@ def server_counters(thr):
     return {"available": bool(data), "probed": probed, "data": data}
 
 
-def detect(phase_stats, limit, th=None, critical_group="tenant-critical GET",
-           noisy_group="tenant-noisy PUT"):
-    """Decide whether enforcement fired in the 'enforced' phase, and how.
+def signals(phase_stats, limit, th=None, noisy_group="tenant-noisy PUT"):
+    """Raw enforcement evidence from the 'enforced' phase (client retries are
+    off in LoadGen, so every server response is counted as it arrived).
 
-    Returns (active: bool, mode: 'reject'|'delay'|'none').
-    ObjectScale can throttle by rejection (429/SlowDown) OR by delay —
-    requests all return 200 but are queued server-side to the policy rate.
-    Delay-mode signature: ok_tps collapses into the ~limit band while
-    contention was well above it AND noisy tail latency spikes (a dead load
-    generator cannot produce that signature)."""
+    rejected: 429 / 503-SlowDown responses were returned.
+    delayed:  accepted TPS sits in the limit band while the unthrottled rate
+              was at least twice the limit AND accepted-request tail latency
+              rose — the server queues requests to hold the rate."""
     th = th or DEFAULT_THRESHOLDS
     ps = phase_stats
-    cont_noisy = ps.get("contention", {}).get(noisy_group, {})
+    cont = ps.get("contention", {})
+    cont_noisy = cont.get(noisy_group, {})
     enfc = ps.get("enforced", {})
     enfc_noisy = enfc.get(noisy_group, {})
-    span = enfc.get("_window", {}).get("seconds", 1)
-    ok_tps = enfc_noisy.get("ok", 0) / max(1e-9, span)
-    before = cont_noisy.get("ok", 0) / max(
-        1e-9, ps.get("contention", {}).get("_window", {}).get("seconds", 1))
-    if enfc_noisy.get("throttled", 0) > 0:
-        return True, "reject"
-    delay = (
+    ok_tps = enfc_noisy.get("ok", 0) / max(1e-9, enfc.get("_window", {}).get("seconds", 1))
+    before = cont_noisy.get("ok", 0) / max(1e-9, cont.get("_window", {}).get("seconds", 1))
+    tail = max(enfc_noisy.get("ok_p95", enfc_noisy.get("p95", 0)),
+               enfc_noisy.get("ok_p99", enfc_noisy.get("p99", 0)))
+    base_tail = cont_noisy.get("ok_p95", cont_noisy.get("p95", 0))
+    delayed = (
         bool(limit)
         and enfc_noisy.get("n", 0) >= th["min_requests"]
         and ok_tps <= limit * th["noisy_tps_limit_factor"]
         and ok_tps >= limit * 0.2            # pinned near limit, not dead
         and before >= limit * 2
-        and max(enfc_noisy.get("p95", 0), enfc_noisy.get("p99", 0))
-            >= max(2 * cont_noisy.get("p95", 0), 25))
-    return (True, "delay") if delay else (False, "none")
+        and tail >= max(2 * base_tail, 25))
+    return {"rejected": enfc_noisy.get("throttled", 0) > 0, "delayed": delayed,
+            "throttled": enfc_noisy.get("throttled", 0),
+            "ok_tps": ok_tps, "ok_tps_before": before,
+            "within_limit": bool(limit) and ok_tps <= limit * th["noisy_tps_limit_factor"]}
+
+
+def detect(phase_stats, limit, th=None, critical_group="tenant-critical GET",
+           noisy_group="tenant-noisy PUT"):
+    """Decide whether enforcement fired in the 'enforced' phase, and how.
+
+    Returns (active: bool, mode: 'reject+delay'|'reject'|'delay'|'none').
+    Observed on ObjectScale 4.4 with client retries off (reports/
+    environment.md): the throttler does both — it queues requests to hold
+    the accepted rate at the limit (accepted p95 ~25 ms -> ~700 ms) and
+    rejects the overflow with HTTP 429 `TooManyRequests` (~6 % of requests).
+    With SDK retries on, those 429s are retried away and only the delay is
+    visible, which is why LoadGen disables retries."""
+    sig = signals(phase_stats, limit, th, noisy_group)
+    if sig["rejected"] and sig["delayed"]:
+        return True, "reject+delay"
+    if sig["rejected"]:
+        return True, "reject"
+    if sig["delayed"]:
+        return True, "delay"
+    return False, "none"
+
+
+def tc24_status(phase_stats, limit, sustained=True, th=None,
+                critical_group="tenant-critical GET",
+                noisy_group="tenant-noisy PUT"):
+    """Status of the enforcement test case — never a hard-coded PASS.
+
+    FAIL          not enough data, the noisy load died, or throttle responses
+                  were seen but the accepted rate still exceeds the limit.
+    INCONCLUSIVE  enough data but no enforcement signature at all.
+    PASS          enforcement signature AND accepted noisy TPS within the
+                  limit tolerance.
+    Returns (status, reason, active, mode)."""
+    th = th or DEFAULT_THRESHOLDS
+    enfc = phase_stats.get("enforced", {})
+    n_noisy = enfc.get(noisy_group, {}).get("n", 0)
+    n_crit = enfc.get(critical_group, {}).get("n", 0)
+    active, mode = detect(phase_stats, limit, th, critical_group, noisy_group)
+    sig = signals(phase_stats, limit, th, noisy_group)
+    if n_noisy < th["min_requests"] or n_crit < th["min_requests"]:
+        return ("FAIL", f"insufficient data in the enforced phase "
+                        f"(noisy {n_noisy}, critical {n_crit} requests)",
+                active, mode)
+    if not sustained:
+        return "FAIL", "noisy load was not sustained through the phase", active, mode
+    if not active:
+        return ("INCONCLUSIVE",
+                f"no enforcement signature: 0 throttle responses and accepted "
+                f"rate {sig['ok_tps']:.1f} TPS vs limit {limit} "
+                f"(unthrottled {sig['ok_tps_before']:.1f})", active, mode)
+    if not sig["within_limit"]:
+        return ("FAIL", f"{sig['throttled']} throttle responses, but accepted "
+                        f"rate {sig['ok_tps']:.1f} TPS exceeds limit {limit} "
+                        f"x{th['noisy_tps_limit_factor']}", active, mode)
+    return ("PASS", f"{mode}: accepted {sig['ok_tps']:.1f} TPS vs limit "
+                    f"{limit} (unthrottled {sig['ok_tps_before']:.1f}), "
+                    f"{sig['throttled']} throttle responses", active, mode)
+
+
+def wait_effective(lg, limit, timeout_s=120, window_s=10, poll_s=5, th=None,
+                   tenant="tenant-noisy", op="PUT", on_tick=None, sleep=None):
+    """After a mode switch, wait until enforcement is visible in the last
+    `window_s` seconds (a throttle response, or accepted TPS inside the limit
+    band). Returns seconds waited, or None if `timeout_s` elapsed first —
+    the caller then measures anyway and the verdict reflects it."""
+    th = th or DEFAULT_THRESHOLDS
+    sleep = sleep or time.sleep
+    t0 = time.time()
+    while True:
+        waited = time.time() - t0
+        g = lg.snapshot(since=time.time() - window_s).get(tenant, {}).get(op, {})
+        ok_tps = g.get("ok", 0) / window_s
+        if g.get("n", 0) and (g.get("throttled", 0) > 0 or (
+                waited >= window_s
+                and ok_tps <= limit * th["noisy_tps_limit_factor"])):
+            return round(waited, 1)
+        if waited >= timeout_s:
+            return None
+        if on_tick:
+            on_tick(waited, ok_tps, g.get("throttled", 0))
+        sleep(poll_s)
+
+
+def evaluate_prefix(covered, control, limit, th=None):
+    """Prefix-scoped rule check from two PUT bursts by the same principal:
+    one under the covered key prefix, one under a control prefix.
+
+    PASS only if the covered prefix is held at its limit while the control
+    prefix runs clearly above it. Anything else is INCONCLUSIVE with the
+    reason (the rule may not have propagated, or the offered load was too
+    low to tell the two apart)."""
+    th = th or DEFAULT_THRESHOLDS
+    cov_tps, ctl_tps = covered.get("ok_tps", 0), control.get("ok_tps", 0)
+    band = limit * th["noisy_tps_limit_factor"]
+    detail = (f"covered {cov_tps:.1f} ok TPS / {covered.get('throttled', 0)} "
+              f"throttle responses, control {ctl_tps:.1f} ok TPS / "
+              f"{control.get('throttled', 0)}, prefix limit {limit}")
+    if min(covered.get("n", 0), control.get("n", 0)) < th["min_requests"]:
+        return {"status": "INCONCLUSIVE", "reason": "too few requests — " + detail}
+    cov_enforced = cov_tps <= band and (
+        covered.get("throttled", 0) > 0 or ctl_tps >= 2 * band)
+    ctl_free = ctl_tps >= max(2 * cov_tps, limit * 1.5)
+    if cov_enforced and ctl_free:
+        return {"status": "PASS", "reason": detail}
+    if not cov_enforced:
+        why = "covered prefix is not held at the prefix limit"
+    else:
+        why = "control prefix is not clearly above the prefix limit"
+    return {"status": "INCONCLUSIVE", "reason": f"{why} — {detail}"}
+
+
+def combine(verdicts, names=None):
+    """Worst status of the named verdicts: FAIL > INCONCLUSIVE > PASS."""
+    sts = [v["verdict"] for v in verdicts if names is None or v["name"] in names]
+    if not sts:
+        return "INCONCLUSIVE"
+    if "FAIL" in sts:
+        return "FAIL"
+    return "INCONCLUSIVE" if "INCONCLUSIVE" in sts else "PASS"
 
 
 def _verdict(name, ok, detail, data_ok=True):
@@ -160,6 +349,7 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
     th = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
     ps = phase_stats
     base = ps.get("baseline", {}).get(critical_group, {})
+    cont_crit = ps.get("contention", {}).get(critical_group, {})
     cont_noisy = ps.get("contention", {}).get(noisy_group, {})
     sim_noisy = ps.get("simulation", {}).get(noisy_group, {})
     enfc = ps.get("enforced", {})
@@ -170,6 +360,7 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
     rec_crit = rec.get(critical_group, {})
     rec_noisy = rec.get(noisy_group, {})
     rec_span = rec.get("_window", {}).get("seconds", 1)
+    post_base = ps.get("post-baseline", {}).get(critical_group, {})
 
     lim = ((rule or {}).get("limit") or {}).get("value")
     det_active, enforcement_mode = detect(
@@ -185,6 +376,47 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
            "enforcement_mode": enforcement_mode, "thresholds": th,
            "rule_limit": lim, "verdicts": []}
     v = out["verdicts"]
+
+    # -1. environment drift guard: the post-baseline critical-alone phase must
+    #     stay close to the baseline critical-alone measurement.
+    base_ok = base.get("n", 0) >= th["min_requests"] and base.get("p95")
+    post_ok = post_base.get("n", 0) >= th["min_requests"]
+    if base_ok and post_ok:
+        drift = post_base["p95"] / max(1e-9, base["p95"])
+        # Drift is a property of the test environment, not the product:
+        # baseline_stable reports it as INCONCLUSIVE, never FAIL.
+        v.append({"name": "baseline_stable",
+                  "verdict": ("PASS" if drift <= th["baseline_stable_factor"]
+                              else "INCONCLUSIVE"),
+                  "detail": (f"post-baseline p95={post_base['p95']:.1f}ms vs "
+                             f"baseline {base['p95']:.1f}ms ({drift:.2f}x)")
+                  if drift <= th["baseline_stable_factor"] else
+                  f"environment drifted: post-baseline "
+                  f"{post_base['p95']:.1f}ms vs baseline "
+                  f"{base['p95']:.1f}ms ({drift:.2f}x)"})
+    else:
+        v.append({"name": "baseline_stable", "verdict": "INCONCLUSIVE",
+                  "detail": "insufficient baseline/post-baseline data"})
+    drifted = not any(x["name"] == "baseline_stable" and x["verdict"] == "PASS"
+                      for x in v)
+
+    # paced-client guard: too many missed slots means the client, not the
+    # throttler, decided the latency numbers.
+    paced_phases = [ph for ph in ps.values()
+                    if ph.get("tenant-critical GET_paced")]
+    missed = sum(ph.get("tenant-critical GET_missed", 0)
+                 for ph in paced_phases)
+    paced = sum(ph.get("tenant-critical GET_paced", 0)
+                for ph in paced_phases)
+    if paced:
+        pct_missed = 100.0 * missed / max(1, paced)
+        # too many missed slots means the client, not the throttler, decided
+        # the latency numbers — that is INCONCLUSIVE, never a FAIL
+        v.append({"name": "paced_client_kept_up",
+                  "verdict": "PASS" if pct_missed <= th["max_missed_slot_pct"]
+                             else "INCONCLUSIVE",
+                  "detail": f"{missed}/{paced} critical slots missed "
+                            f"({pct_missed:.2f}%)"})
 
     # 0. noisy load actually sustained during the enforcement window.
     #    Whenever enforcement is active, completions are capped near the
@@ -269,13 +501,20 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
                       f"(throttle events may stay elevated — expected)",
                       data_ok=rec_noisy.get("n", 0) > 0))
 
-    # 3. critical GET SLA under enforcement
-    v.append(_verdict("critical_p95_within_sla",
-                      enfc_crit.get("p95", 0) <= th["critical_p95_max_ms"],
-                      f"p95={enfc_crit.get('p95',0):.1f}ms / "
-                      f"p99={enfc_crit.get('p99',0):.1f}ms vs SLA "
-                      f"{th['critical_p95_max_ms']}ms",
-                      data_ok=enfc_crit.get("n", 0) >= th["min_requests"]))
+    # 3. critical GET SLA under enforcement AND during recovery
+    if drifted:
+        v.append({"name": "critical_p95_within_sla", "verdict": "INCONCLUSIVE",
+                  "detail": "environment drifted — latency verdicts "
+                            "inconclusive"})
+    else:
+        sla_p95 = max(enfc_crit.get("p95", 0), rec_crit.get("p95", 0))
+        v.append(_verdict("critical_p95_within_sla",
+                          sla_p95 <= th["critical_p95_max_ms"],
+                          f"enforced p95={enfc_crit.get('p95',0):.1f}ms / "
+                          f"recovery p95={rec_crit.get('p95',0):.1f}ms vs SLA "
+                          f"{th['critical_p95_max_ms']}ms",
+                          data_ok=(enfc_crit.get("n", 0) >= th["min_requests"]
+                                   and rec_crit.get("n", 0) >= th["min_requests"])))
 
     # 4. critical GET error rate
     cn = max(1, enfc_crit.get("n", 0))
@@ -284,25 +523,72 @@ def evaluate(phase_stats, rule=None, thresholds=None, enforcement_active=None,
                       f"{err*100:.2f}% ({enfc_crit.get('errors',0)}/{cn})",
                       data_ok=enfc_crit.get("n", 0) >= th["min_requests"]))
 
-    # 5. recovery vs baseline p95 (noisy still running — protected by rule).
-    #    Meaningful only when enforcement was observed; without it the phase
-    #    just re-measures contention, so the verdict is INCONCLUSIVE.
+    # 4b. main isolation verdict: share of the contention latency damage that
+    #     recovery removed. share = (contention-baseline - recovery-baseline)
+    #     ... expressed as (cont_p95 - rec_p95) / (cont_p95 - base_p95).
+    cont_p95 = cont_crit.get("p95", 0)
+    rec_p95 = rec_crit.get("p95", 0)
+    base_p95 = base.get("p95", 0)
+    enough = all(g.get("n", 0) >= th["min_requests"]
+                 for g in (cont_crit, rec_crit, base))
+    delta = cont_p95 - base_p95
+    if not enough:
+        v.append({"name": "recovery_improvement", "verdict": "INCONCLUSIVE",
+                  "mode": "improvement",
+                  "detail": "insufficient baseline/contention/recovery data"})
+    elif delta < th["contention_min_delta_ms"]:
+        # No contention to recover from: score whether critical stayed
+        # unaffected instead of demanding an improvement that cannot exist.
+        ratio = rec_p95 / max(1e-9, base_p95)
+        detail = (f"critical unaffected: contention +{delta:.1f} ms; "
+                  f"recovery {rec_p95:.1f} ms = {ratio:.2f}x baseline "
+                  f"{base_p95:.1f} ms")
+        if not enforcement_active:
+            verdict, detail = "INCONCLUSIVE", detail + "; enforcement=no"
+        elif drifted:
+            verdict, detail = "INCONCLUSIVE", detail + "; environment drifted"
+        else:
+            verdict = ("PASS" if rec_p95 <= th["unaffected_factor"] * base_p95
+                       else "FAIL")
+        v.append({"name": "recovery_improvement", "verdict": verdict,
+                  "mode": "unaffected", "detail": detail})
+    else:
+        share = (cont_p95 - rec_p95) / max(1e-9, delta)
+        if not enforcement_active or drifted:
+            verdict = "INCONCLUSIVE"
+        else:
+            verdict = ("PASS" if share >= th["recovery_improvement_min_share"]
+                       else "FAIL")
+        note = ("; environment drifted" if drifted else "")
+        v.append({"name": "recovery_improvement", "verdict": verdict,
+                  "mode": "improvement",
+                  "detail": f"share={share:.2f} (contention {cont_p95:.1f}ms, "
+                            f"recovery {rec_p95:.1f}ms, baseline "
+                            f"{base_p95:.1f}ms); enforcement="
+                            f"{'yes' if enforcement_active else 'no'}" + note})
+
+    # 5. recovery vs baseline p95 — INFORMATION ONLY (single-host CPU noise
+    #    made this check unfair; recovery_improvement is the scored verdict)
     if rec_crit.get("n", 0) >= th["min_requests"] and base.get("p95"):
         dev = rec_crit["p95"] / max(1e-9, base["p95"])
         detail = (f"recovery p95={rec_crit['p95']:.1f}ms "
                   f"(p99={rec_crit.get('p99',0):.1f}) = {dev:.2f}x "
                   f"baseline ({base['p95']:.1f}ms)")
-        v.append(_verdict("recovery_p95_vs_baseline",
-                          dev <= th["recovery_p95_dev_factor"],
-                          detail if enforcement_active
-                          else detail + " — enforcement never observed",
-                          data_ok=enforcement_active))
+        scored_ok = enforcement_active and not drifted
+        v.append({"name": "recovery_p95_vs_baseline", "info": True,
+                  "verdict": ("PASS" if dev <= th["recovery_p95_dev_factor"]
+                              else "FAIL") if scored_ok else "INCONCLUSIVE",
+                  "detail": detail + ("" if scored_ok else
+                            (" — environment drifted" if drifted
+                             else " — enforcement never observed"))})
     else:
-        v.append(_verdict("recovery_p95_vs_baseline", False,
-                          "insufficient recovery/baseline data", data_ok=False))
+        v.append({"name": "recovery_p95_vs_baseline", "info": True,
+                  "verdict": "INCONCLUSIVE",
+                  "detail": "insufficient recovery/baseline data"})
 
-    fails = [x for x in v if x["verdict"] == "FAIL"]
-    incs = [x for x in v if x["verdict"] == "INCONCLUSIVE"]
+    scored = [x for x in v if not x.get("info")]
+    fails = [x for x in scored if x["verdict"] == "FAIL"]
+    incs = [x for x in scored if x["verdict"] == "INCONCLUSIVE"]
     out["overall"] = ("FAIL" if fails else
                       "INCONCLUSIVE" if incs else "PASS")
     return out

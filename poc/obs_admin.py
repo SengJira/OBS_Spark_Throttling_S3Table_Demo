@@ -4,21 +4,20 @@ Token auth: GET /login (basic root) -> X-SDS-AUTH-TOKEN.
 The 4443 cert has SAN=localhost only, so hostname checking is disabled for this
 endpoint ONLY — the certificate chain itself is still verified against the
 imported OBS CA (no blanket verify=False)."""
-import requests, urllib3, threading
+import json, pathlib, re, threading
+import xml.etree.ElementTree as ET
+
+import requests
 from requests.adapters import HTTPAdapter
 
 from . import config
-
-# hostname verification disabled only on the session used for 4443;
-# chain verification stays enabled (adapter still uses cert chain via CA bundle).
-_urllib3_warnings_done = False
 
 
 class _PinNoHostnameAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **kw):
         kw["assert_hostname"] = False
         kw["cert_reqs"] = "CERT_REQUIRED"
-        kw["ca_certs"] = "/etc/ssl/certs/ca-certificates.crt"
+        kw["ca_certs"] = config.CA_BUNDLE
         return super().init_poolmanager(connections, maxsize, block, **kw)
 
 
@@ -29,7 +28,7 @@ class MgmtApi:
         self._password = password or config.OBS_ROOT_PASSWORD
         self.s = requests.Session()
         self.s.mount("https://", _PinNoHostnameAdapter())
-        self.s.verify = "/etc/ssl/certs/ca-certificates.crt"
+        self.s.verify = config.CA_BUNDLE
         self._token = None
         self._lock = threading.Lock()
 
@@ -47,10 +46,11 @@ class MgmtApi:
 
     def req(self, method, path, retry=True, **kw):
         kw.setdefault("timeout", 30)
-        hdrs = self._hdrs()
-        if "headers" in kw:
-            hdrs = {**hdrs, **kw.pop("headers")}
-        r = self.s.request(method, f"{self.base}{path}", headers=hdrs, **kw)
+        # merge without mutating kw: the 401 retry below must still carry the
+        # caller's headers (e.g. x-emc-namespace on IAM calls)
+        hdrs = {**self._hdrs(), **(kw.get("headers") or {})}
+        r = self.s.request(method, f"{self.base}{path}",
+                           **{**kw, "headers": hdrs})
         if r.status_code == 401 and retry:  # token expired
             with self._lock:
                 self._token = None
@@ -79,10 +79,18 @@ class MgmtApi:
                      headers={"x-emc-namespace": namespace or config.OBS_NAMESPACE})
         return r
 
+    def version(self):
+        """ObjectScale version string from GET /vdc/nodes, or None."""
+        r = self.get("/vdc/nodes")
+        if r.status_code != 200:
+            return None
+        m = re.search(r"<version>([^<]+)</version>", r.text) or re.search(
+            r'"version"\s*:\s*"([^"]+)"', r.text)
+        return m.group(1) if m else None
+
     # ---------------- CMF config ----------------
     def get_config(self, name):
         """Read a CMF config param; returns configured or default value."""
-        import xml.etree.ElementTree as ET
         r = self.get(f"/config/{name}")
         if r.status_code != 200:
             return None
@@ -103,6 +111,15 @@ class MgmtApi:
 # ---------------- Throttler ----------------
 THROTTLE_STATE = "com.emc.ecs.common.request.throttle.mvp.state"
 THROTTLE_RESPONSE_CODE = "com.emc.ecs.common.request.throttle.mvp.response_code"
+DEMO_RULE_PREFIX = "demo-"
+
+
+class BackupMissing(FileNotFoundError):
+    """The pre-demo throttler backup file does not exist."""
+
+
+class BackupRefused(RuntimeError):
+    """Live throttler state is not a clean pre-demo state."""
 
 
 class Throttler:
@@ -171,24 +188,65 @@ class Throttler:
         r.raise_for_status()
         return r.json()
 
+    # ---- backup / restore ----
+    def snapshot(self):
+        return {"config": self.get_config(), "mode": self.get_mode(),
+                "response_code": self.get_response_code()}
+
     def backup(self, path):
-        import json
-        snap = {
-            "config": self.get_config(),
-            "mode": self.get_mode(),
-            "response_code": self.get_response_code(),
-        }
-        pathlib = __import__("pathlib")
+        """Unconditionally write the live state to `path` (see safe_backup)."""
+        snap = self.snapshot()
         pathlib.Path(path).write_text(json.dumps(snap, indent=2))
         return snap
 
+    def safe_backup(self, path=None, force=False):
+        """Capture the PRE-demo state exactly once.
+
+        Returns ("kept", None) when a backup already exists (never overwritten
+        without `force`), or ("written", snapshot). Raises BackupRefused when
+        the live state is not a clean pre-demo state — demo-* rules present or
+        mode not Disabled — because backing that up would make a later
+        restore() re-apply demo throttling."""
+        path = pathlib.Path(path or config.BACKUP_FILE)
+        if path.exists() and not force:
+            return "kept", None
+        snap = self.snapshot()
+        rules = snap["config"].get("throttle", {}).get("rules", [])
+        demo = [r.get("id") for r in rules
+                if str(r.get("id", "")).startswith(DEMO_RULE_PREFIX)]
+        if not force and (demo or snap["mode"] != "disabled"):
+            raise BackupRefused(
+                f"refusing to back up the throttler: live state is not a clean "
+                f"pre-demo state (mode={snap['mode']}, demo rules={demo}). "
+                f"Restore the real baseline first, or pass --force-backup.")
+        path.write_text(json.dumps(snap, indent=2))
+        return "written", snap
+
     def restore(self, path=None):
-        path = path or config.BACKUP_FILE
-        import json
-        snap = json.loads(__import__("pathlib").Path(str(path)).read_text())
-        self.put_config(snap["config"]["throttle"]["rules"])
+        """Restore the backup: mode -> disabled first (so no half-restored
+        rule set is ever enforced), then the rules, then the original mode
+        and response code."""
+        path = pathlib.Path(str(path or config.BACKUP_FILE))
+        if not path.exists():
+            raise BackupMissing(
+                f"throttler backup {path} not found — nothing restored. "
+                f"Create it with scripts/prep_obs.py while the throttler is "
+                f"in its pre-demo state.")
+        snap = json.loads(path.read_text())
+        self.set_mode("disabled")
+        self.put_config(snap["config"].get("throttle", {}).get("rules", []))
+        self.set_response_code(int(snap["response_code"]))
         self.set_mode(snap["mode"])
-        self.set_response_code(snap["response_code"])
+        return {"mode": snap["mode"], "response_code": snap["response_code"],
+                "rules": len(snap["config"].get("throttle", {}).get("rules", []))}
+
+    def restore_logged(self, path=None):
+        """restore() for atexit handlers: report the error instead of raising."""
+        try:
+            return self.restore(path)
+        except Exception as e:
+            print(f"WARNING: throttler restore failed: {type(e).__name__}: {e}")
+            return None
 
 
 def rule(id, limit_tps, principals=None, verbs=None, actions=None,

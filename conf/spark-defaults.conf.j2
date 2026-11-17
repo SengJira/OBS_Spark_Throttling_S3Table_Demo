@@ -1,5 +1,12 @@
-# Spark 4.2 PoC — rendered by scripts/render_conf.py from this template + .env
-# Secrets are injected at render time; the RENDERED file must stay chmod 0600.
+# Spark 4.2 PoC — cluster-wide defaults, rendered by scripts/render_conf.py.
+#
+# Only settings that belong to the cluster as a whole live here (master,
+# event log / history server, SQL defaults, secret redaction). Everything
+# that is per session — S3A options, the Iceberg `os` catalog and above all
+# the credentials — is set by poc/spark_helpers.build_session(), the single
+# source of truth for session configuration. This file therefore contains
+# no secrets. (When a secret placeholder is added here, render_conf.py
+# refuses to render it empty and writes the result with mode 0600.)
 
 spark.master                     {{SPARK_MASTER}}
 spark.eventLog.enabled           true
@@ -8,45 +15,5 @@ spark.history.fs.logDirectory    file:///var/log/spark-events
 spark.history.ui.port            18080
 spark.sql.adaptive.enabled       true
 spark.serializer                 org.apache.spark.serializer.KryoSerializer
-
-# ---------- S3A -> ObjectScale ----------
-spark.hadoop.fs.s3a.endpoint                {{OBS_S3_ENDPOINT}}
-spark.hadoop.fs.s3a.endpoint.region         {{OBS_REGION}}
-spark.hadoop.fs.s3a.path.style.access       true
-spark.hadoop.fs.s3a.impl                    org.apache.hadoop.fs.s3a.S3AFileSystem
-spark.hadoop.fs.s3a.aws.credentials.provider  org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
-spark.hadoop.fs.s3a.access.key              {{POC_ADMIN_AK}}
-spark.hadoop.fs.s3a.secret.key              {{POC_ADMIN_SK}}
-spark.hadoop.fs.s3a.connection.ssl.enabled  true
-spark.hadoop.fs.s3a.committer.name          magic
-spark.hadoop.fs.s3a.committer.magic.enabled true
-spark.hadoop.fs.s3a.connection.maximum      200
-spark.hadoop.fs.s3a.threads.max             64
-spark.hadoop.fs.s3a.multipart.size          128M
-spark.hadoop.fs.s3a.retry.throttle.limit    20
-spark.hadoop.fs.s3a.retry.throttle.interval 500ms
-spark.hadoop.fs.s3a.change.detection.mode   none
-spark.hadoop.fs.s3a.experimental.input.fadvise  random
-
-# ---------- Iceberg REST catalog 'os' (ObjectScale S3 Tables) ----------
-spark.sql.extensions                              org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
-spark.sql.catalog.os                              org.apache.iceberg.spark.SparkCatalog
-spark.sql.catalog.os.type                         rest
-spark.sql.catalog.os.uri                          {{OBS_TABLES_ENDPOINT}}/iceberg
-spark.sql.catalog.os.warehouse                    {{ICEBERG_WAREHOUSE}}
-spark.sql.catalog.os.prefix                       {{ICEBERG_PREFIX}}
-spark.sql.catalog.os.rest.sigv4-enabled           true
-spark.sql.catalog.os.rest.signing-name            {{ICEBERG_SIGNING_NAME}}
-spark.sql.catalog.os.rest.signing-region          {{OBS_REGION}}
-spark.sql.catalog.os.io-impl                      org.apache.iceberg.aws.s3.S3FileIO
-spark.sql.catalog.os.s3.endpoint                  {{OBS_S3_ENDPOINT}}
-spark.sql.catalog.os.s3.path-style-access         true
-spark.sql.catalog.os.s3.delete-enabled            true
-spark.sql.catalog.os.client.region                {{OBS_REGION}}
-
-# AWS SDK v2 creds for SigV4 (REST + S3FileIO) -> executors + driver default chain
-spark.executorEnv.AWS_ACCESS_KEY_ID           {{TABLES_RW_AK}}
-spark.executorEnv.AWS_SECRET_ACCESS_KEY       {{TABLES_RW_SK}}
-spark.executorEnv.AWS_REGION                  {{OBS_REGION}}
-spark.executorEnv.AWS_REQUEST_CHECKSUM_CALCULATION     {{AWS_REQUEST_CHECKSUM_CALCULATION}}
-spark.executorEnv.AWS_RESPONSE_CHECKSUM_VALIDATION     {{AWS_RESPONSE_CHECKSUM_VALIDATION}}
+# mask credentials (incl. '...access-key-id') in the UI and event log
+spark.redaction.regex            (?i)secret|password|token|access[._-]?key

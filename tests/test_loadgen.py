@@ -14,6 +14,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from botocore.exceptions import ClientError
 from poc import loadgen, s3util, throttle_eval
 
+real_s3 = s3util.s3          # captured before the autouse fixture patches it
+
 
 class FakeBody:
     closed = 0
@@ -44,9 +46,12 @@ class FakeS3:
     ok_retries = 0               # RetryAttempts reported on successful GET
     block_get = None             # threading.Event: GET blocks until set
     latency_s = 0.001
+    put_ok_retries = 0           # RetryAttempts reported on successful PUT
+    created = []                 # (user, kwargs) per client construction
 
     def __init__(self, user="admin", **kw):
         self.user = user
+        FakeS3.created.append((user, kw))
 
     def put_object(self, Bucket, Key, Body=b"", ContentLength=0, **kw):
         time.sleep(FakeS3.latency_s)
@@ -58,7 +63,8 @@ class FakeS3:
             if FakeS3.status_503:
                 raise throttle_error(code=FakeS3.status_503, status=503)
         FakeS3.store[(Bucket, Key)] = bytes(Body)
-        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        return {"ResponseMetadata": {"HTTPStatusCode": 200,
+                                     "RetryAttempts": FakeS3.put_ok_retries}}
 
     def get_object(self, Bucket, Key, **kw):
         if FakeS3.block_get is not None:
@@ -78,6 +84,7 @@ def fake_s3(monkeypatch):
     FakeS3.store, FakeS3.put_calls = {}, []
     FakeS3.throttle_after, FakeS3.status_503 = None, None
     FakeS3.ok_retries, FakeS3.block_get = 0, None
+    FakeS3.put_ok_retries, FakeS3.created = 0, []
     FakeBody.closed = 0
     monkeypatch.setattr(s3util, "s3", lambda *a, **k: FakeS3(*a, **k))
     yield
@@ -164,6 +171,83 @@ def test_retries_captured_on_success_and_failure():
     lg.stop()
     g = lg.phase_stats()["p"].get("tenant-critical GET", {})
     assert g.get("retries_ok", 0) >= 2 and g.get("retries_fail", 0) == 0
+
+
+def test_workers_use_clients_with_retries_disabled():
+    # every server response must be observed raw (#1): no SDK retries
+    lg = loadgen.LoadGen(bucket="b", max_keys=0)
+    lg.start(); time.sleep(0.2); lg.stop()
+    workers = [kw for u, kw in FakeS3.created if "timeout_s" in kw]
+    assert workers and all(kw.get("max_attempts") == 1 for kw in workers)
+
+
+def test_s3_factory_retry_parameter():
+    # max_attempts=1 must mean ONE try in total. botocore's `max_attempts`
+    # counts retries (1 = one retry), so the factory has to use
+    # `total_max_attempts` — checked on a real client's resolved config.
+    s3util.config.USERS["admin"] = ("TESTACCESSKEYEXAMPLE", "x" * 40)
+    cli = real_s3(max_attempts=1)
+    assert cli.meta.config.retries["total_max_attempts"] == 1
+    assert "max_attempts" not in cli.meta.config.retries
+    assert cli.meta.config.retries["mode"] == "standard"
+    default = real_s3().meta.config.retries["total_max_attempts"]
+    assert default == s3util.DEFAULT_MAX_ATTEMPTS > 1
+
+
+def test_single_attempt_client_does_not_retry_a_429():
+    # end to end through botocore: a 429 must surface after exactly one request
+    from botocore.awsrequest import AWSResponse
+    s3util.config.USERS["admin"] = ("TESTACCESSKEYEXAMPLE", "x" * 40)
+    cli = real_s3(max_attempts=1, endpoint="https://s3.invalid")
+    sent = []
+
+    def answer_429(request, **kw):
+        sent.append(request.url)
+        raw = types.SimpleNamespace(stream=lambda *a, **k: iter(()), read=lambda *a, **k: b"")
+        resp = AWSResponse(request.url, 429, {}, raw)
+        resp._content = (b"<Error><Code>TooManyRequests</Code>"
+                         b"<Message>slow</Message></Error>")
+        return resp
+    cli.meta.events.register("before-send.s3.PutObject", answer_429)
+    with pytest.raises(ClientError) as ei:
+        cli.put_object(Bucket="b", Key="k", Body=b"x")
+    assert len(sent) == 1, f"request was sent {len(sent)} times"
+    md = ei.value.response["ResponseMetadata"]
+    assert md["HTTPStatusCode"] == 429 and md["RetryAttempts"] == 0
+    assert loadgen.classify(429, ei.value.response["Error"]["Code"]) == "r429"
+
+
+@pytest.mark.parametrize("code,status,field", [
+    ("SlowDown", 503, "r503_slowdown"),
+    ("SlowDown", 429, "r429"),
+    ("TooManyRequests", 429, "r429"),
+])
+def test_raw_throttle_responses_counted_as_throttled(code, status, field):
+    # with retries off a scripted rejection must surface as throttled, not ok
+    orig = FakeS3.put_object
+    def reject(self, Bucket, Key, Body=b"", ContentLength=0, **kw):
+        if self.user == "noisy":
+            time.sleep(0.001)
+            raise throttle_error(code=code, status=status)
+        return orig(self, Bucket, Key, Body, ContentLength, **kw)
+    FakeS3.put_object = reject
+    try:
+        lg = loadgen.LoadGen(bucket="b", max_keys=0)
+        lg.start(); lg.start_phase("p"); time.sleep(0.4); lg.stop()
+    finally:
+        FakeS3.put_object = orig
+    g = lg.phase_stats()["p"]["tenant-noisy PUT"]
+    assert g["throttled"] == g["n"] > 0 and g["ok"] == 0
+    assert g[field] == g["n"]
+
+
+def test_retries_counted_on_successful_noisy_put():
+    FakeS3.put_ok_retries = 3
+    lg = loadgen.LoadGen(bucket="b", max_keys=0)
+    lg.start(noisy=True, critical=False); lg.start_phase("p")
+    time.sleep(0.3); lg.stop()
+    g = lg.phase_stats()["p"]["tenant-noisy PUT"]
+    assert g["ok"] > 0 and g["retries_ok"] == 3 * g["ok"]
 
 
 def test_noisy_stop_and_restart():
@@ -344,7 +428,7 @@ def test_verify_rule_accepts_valid():
     lambda r: r.update(bogus=1),
     lambda r: r.update(rateUnit="PPS"),
     lambda r: r["filters"].pop("principals"),
-    lambda r: r.update(limit={"value": 0}),
+    lambda r: r.update(limit={"value": -1}),
     lambda r: r["filters"].update(paths={"matcher": "fuzzy", "values": []}),
 ])
 def test_verify_rule_rejects_bad(mutate):
@@ -370,7 +454,7 @@ def _stats(noisy_ok, noisy_thr, crit_p95, rec_p95, base_p95,
            enforced_s=120, contention_n=10000, sim_thr=0,
            rec_noisy_n=12000, rec_crit_thr=0,
            enf_noisy_p95=0, cont_noisy_p95=15):
-    return {
+    out = {
         "baseline": {"tenant-critical GET": _g(500, p95=base_p95),
                      "_window": {"seconds": 60}},
         "contention": {"tenant-noisy PUT": _g(250, n=contention_n,
@@ -391,7 +475,17 @@ def _stats(noisy_ok, noisy_thr, crit_p95, rec_p95, base_p95,
                                             thr=rec_noisy_n // 3),
                      "tenant-critical GET": _g(500, p95=rec_p95,
                                                thr=rec_crit_thr),
-                     "_window": {"seconds": 60}}}
+                     "_window": {"seconds": 60}},
+        "pre-baseline": {"tenant-critical GET": _g(100, p95=base_p95),
+                         "_window": {"seconds": 60}},
+        "reference": {"tenant-critical GET": _g(100, p95=base_p95),
+                      "_window": {"seconds": 60}},
+        "post-baseline": {"tenant-critical GET": _g(100, p95=base_p95),
+                          "_window": {"seconds": 60}}}
+    for ph in out.values():
+        ph.setdefault("tenant-critical GET_paced", 6000)
+        ph.setdefault("tenant-critical GET_missed", 0)
+    return out
 
 
 def test_evaluate_pass_when_enforced():
@@ -505,3 +599,253 @@ def test_evaluate_no_delay_when_latency_flat():
 def test_server_counters_reports_unavailable():
     srv = throttle_eval.server_counters(FakeThr())
     assert srv["available"] is False and "data" in srv
+
+
+# ---------- throughput sweep (#8) ----------
+
+def test_multipart_sweep_sizes_pool_for_widest_level(monkeypatch):
+    from poc import throughput
+    seen, bodies = {}, set()
+
+    class Cli:
+        def create_multipart_upload(self, **kw): return {"UploadId": "u"}
+        def upload_part(self, Body, **kw):
+            bodies.add(id(Body)); return {"ETag": "e"}
+        def complete_multipart_upload(self, **kw): return {}
+        def abort_multipart_upload(self, **kw): return {}
+
+    def factory(user="admin", **kw):
+        seen.update(kw); return Cli()
+    monkeypatch.setattr(s3util, "s3", factory)
+    rows = throughput.multipart_sweep("b", "p", levels=(1, 4, 16),
+                                      total_mb=2, part_mb=1)
+    assert seen["max_pool_connections"] >= 16
+    assert [r["concurrency"] for r in rows] == [1, 4, 16]
+    assert len(bodies) == 1, "part buffer must be allocated once, not per level"
+
+
+# ---------- prefix burst + TC2.4/TC2.6 evaluation (#3, #5) ----------
+
+def test_put_burst_reports_ok_tps_and_throttles_per_prefix():
+    orig = FakeS3.put_object
+    def by_prefix(self, Bucket, Key, Body=b"", ContentLength=0, **kw):
+        time.sleep(0.002)
+        if "/raw/" in Key:
+            raise throttle_error(code="TooManyRequests", status=429)
+        return {"ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 0}}
+    FakeS3.put_object = by_prefix
+    try:
+        cov = loadgen.put_burst("noisy", "b", "demo-x/raw", seconds=0.4, threads=2)
+        ctl = loadgen.put_burst("noisy", "b", "demo-x/curated", seconds=0.4, threads=2)
+    finally:
+        FakeS3.put_object = orig
+    assert cov["ok"] == 0 and cov["r429"] == cov["n"] > 0 and cov["ok_tps"] == 0
+    assert ctl["throttled"] == 0 and ctl["ok_tps"] > 10
+    assert all(kw.get("max_attempts") == 1 for u, kw in FakeS3.created)
+
+
+def _burst(ok_tps, throttled=0, n=500):
+    return {"n": n, "ok_tps": ok_tps, "throttled": throttled}
+
+
+@pytest.mark.parametrize("cov,ctl,want", [
+    (_burst(9, 40), _burst(46, 3), "PASS"),           # covered held, control free
+    (_burst(9, 0), _burst(46, 0), "PASS"),            # held by delay only
+    (_burst(45, 0), _burst(46, 0), "INCONCLUSIVE"),   # prefix rule not effective
+    (_burst(9, 40), _burst(10, 40), "INCONCLUSIVE"),  # control limited as well
+    (_burst(9, 40, n=10), _burst(46, 0), "INCONCLUSIVE"),  # too little data
+])
+def test_evaluate_prefix(cov, ctl, want):
+    out = throttle_eval.evaluate_prefix(cov, ctl, limit=10)
+    assert out["status"] == want and out["reason"]
+
+
+def test_tc24_status_pass_requires_signature_and_rate_within_limit():
+    st = _stats(noisy_ok=5400, noisy_thr=350, crit_p95=15, rec_p95=10,
+                base_p95=9, enf_noisy_p95=700)
+    status, reason, active, mode = throttle_eval.tc24_status(st, 50)
+    assert (status, active, mode) == ("PASS", True, "reject+delay"), reason
+
+
+def test_tc24_status_inconclusive_without_any_signature():
+    st = _stats(noisy_ok=30000, noisy_thr=0, crit_p95=20, rec_p95=10, base_p95=9)
+    status, reason, active, _ = throttle_eval.tc24_status(st, 50)
+    assert status == "INCONCLUSIVE" and not active and "no enforcement" in reason
+
+
+def test_tc24_status_fail_when_rejections_do_not_hold_the_limit():
+    st = _stats(noisy_ok=30000, noisy_thr=5, crit_p95=20, rec_p95=10, base_p95=9)
+    status, reason, active, _ = throttle_eval.tc24_status(st, 50)
+    assert status == "FAIL" and active and "exceeds limit" in reason
+
+
+def test_tc24_status_fail_on_insufficient_data_or_dead_load():
+    st = _stats(noisy_ok=10, noisy_thr=5, crit_p95=20, rec_p95=10, base_p95=9)
+    assert throttle_eval.tc24_status(st, 50)[0] == "FAIL"
+    st = _stats(noisy_ok=5400, noisy_thr=350, crit_p95=15, rec_p95=10, base_p95=9)
+    status, reason, _, _ = throttle_eval.tc24_status(st, 50, sustained=False)
+    assert status == "FAIL" and "not sustained" in reason
+
+
+def test_wait_effective_returns_when_throttle_seen_and_none_on_timeout():
+    class LG:
+        def __init__(self, seq): self.seq = list(seq)
+        def snapshot(self, since=None):
+            g = self.seq.pop(0) if len(self.seq) > 1 else self.seq[0]
+            return {"tenant-noisy": {"PUT": g}}
+    free = {"n": 3000, "ok": 3000, "throttled": 0}
+    hit = {"n": 500, "ok": 460, "throttled": 40}
+    assert throttle_eval.wait_effective(
+        LG([free, free, hit]), 50, timeout_s=60, sleep=lambda s: None) is not None
+    assert throttle_eval.wait_effective(
+        LG([free]), 50, timeout_s=0, sleep=lambda s: None) is None
+
+
+def test_combine_takes_the_worst_status():
+    v = [{"name": "a", "verdict": "PASS"}, {"name": "b", "verdict": "INCONCLUSIVE"},
+         {"name": "c", "verdict": "FAIL"}]
+    assert throttle_eval.combine(v) == "FAIL"
+    assert throttle_eval.combine(v, {"a", "b"}) == "INCONCLUSIVE"
+    assert throttle_eval.combine(v, {"a"}) == "PASS"
+    assert throttle_eval.combine(v, {"zzz"}) == "INCONCLUSIVE"
+
+
+# ---------- TC3.7 denial classification (#7) ----------
+
+@pytest.mark.parametrize("text,denied", [
+    ("Job aborted\nCaused by: software.amazon.awssdk.services.s3.model."
+     "AccessDeniedException: Access Denied (Service: S3, Status Code: 403, "
+     "Request ID: abc:1)", True),
+    (": org.apache.iceberg.exceptions.ForbiddenException: Forbidden: Not "
+     "authorized to make this request", True),
+    ("[INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS] Cannot write to "
+     "`os`.`pocns`.`orders_ice`", False),
+    ("java.net.ConnectException: Connection refused", False),
+])
+def test_access_denied_reason_only_matches_permission_failures(text, denied):
+    from poc import spark_helpers
+    reason = spark_helpers.access_denied_reason(Exception(text))
+    assert bool(reason) is denied
+    if reason:
+        assert "Request ID" not in reason
+
+
+def test_cpu_pct_and_phase_window_reports_client_cpu():
+    assert loadgen.cpu_pct((100, 1000), (150, 1200)) == 25.0
+    assert loadgen.cpu_pct(None, (1, 2)) is None
+    assert loadgen.cpu_pct((5, 10), (5, 10)) is None          # no time elapsed
+    lg = loadgen.LoadGen(bucket="b", max_keys=0)
+    lg.start(noisy=False, critical=True); lg.start_phase("p"); time.sleep(0.3); lg.stop()
+    cpu = lg.phase_stats()["p"]["_window"]["client_cpu_pct"]
+    assert cpu is None or 0 <= cpu <= 100
+
+
+def test_settle_waits_for_local_inflight_tail(monkeypatch):
+    monkeypatch.setattr(FakeS3, "latency_s", 0.05)
+    lg = loadgen.LoadGen(bucket="b", max_keys=0, run_id="demo-test",
+                         timeout_s=(1, 2))
+    lg.add_noisy(threads=3)
+    lg.start_phase("p")
+    time.sleep(0.15)
+    end = time.time()
+    lg.settle(end, timeout_s=5)
+    n1 = sum(1 for e in lg.events
+             if e.tenant == "tenant-noisy" and e.ts < end)
+    time.sleep(0.3)
+    n2 = sum(1 for e in lg.events
+             if e.tenant == "tenant-noisy" and e.ts < end)
+    assert n1 == n2 and n1 > 0
+    lg.stop()
+
+
+def test_evaluate_drift_makes_recovery_inconclusive():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    st["post-baseline"]["tenant-critical GET"]["p95"] = 30
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    # drift is an environment problem: INCONCLUSIVE, never FAIL
+    assert names["baseline_stable"] == "INCONCLUSIVE"
+    assert names["recovery_improvement"] == "INCONCLUSIVE"
+    assert names["critical_p95_within_sla"] == "INCONCLUSIVE"
+    assert out["overall"] == "INCONCLUSIVE"
+
+
+def test_evaluate_recovery_improvement_pass():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["recovery_improvement"] == "PASS"
+
+
+def test_evaluate_recovery_improvement_fail():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=28, base_p95=9)
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["recovery_improvement"] == "FAIL"
+
+
+def _no_contention_stats(rec_p95=10, base_p95=9, post_p95=None):
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=rec_p95, base_p95=base_p95)
+    st["contention"]["tenant-critical GET"]["p95"] = base_p95 + 1
+    if post_p95 is not None:
+        st["post-baseline"]["tenant-critical GET"]["p95"] = post_p95
+    return st
+
+
+def _ri(out):
+    return next(v for v in out["verdicts"]
+                if v["name"] == "recovery_improvement")
+
+
+def test_evaluate_no_contention_unaffected_pass():
+    out = throttle_eval.evaluate(_no_contention_stats(rec_p95=10), rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "PASS" and v["mode"] == "unaffected"
+    assert "critical unaffected" in v["detail"]
+
+
+def test_evaluate_no_contention_unaffected_fail():
+    # recovery p95 above 1.25x baseline even with no contention => FAIL
+    out = throttle_eval.evaluate(_no_contention_stats(rec_p95=20), rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "FAIL" and v["mode"] == "unaffected"
+
+
+def test_evaluate_no_contention_drift_inconclusive():
+    out = throttle_eval.evaluate(
+        _no_contention_stats(rec_p95=10, post_p95=40), rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "INCONCLUSIVE" and v["mode"] == "unaffected"
+
+
+def test_evaluate_no_contention_no_enforcement_inconclusive():
+    st = _no_contention_stats(rec_p95=10)
+    st["enforced"]["tenant-noisy PUT"]["throttled"] = 0
+    st["enforced"]["tenant-noisy PUT"]["r429"] = 0
+    st["enforced"]["tenant-noisy PUT"]["ok"] = st["enforced"][
+        "tenant-noisy PUT"]["n"]
+    out = throttle_eval.evaluate(st, rule=RULE)
+    v = _ri(out)
+    assert v["verdict"] == "INCONCLUSIVE" and v["mode"] == "unaffected"
+
+
+def test_evaluate_paced_client_misses_are_inconclusive():
+    st = _stats(noisy_ok=6000, noisy_thr=24000, crit_p95=20,
+                rec_p95=10, base_p95=9)
+    st["baseline"]["tenant-critical GET_missed"] = 5000
+    out = throttle_eval.evaluate(st, rule=RULE)
+    names = {v["name"]: v["verdict"] for v in out["verdicts"]}
+    assert names["paced_client_kept_up"] == "INCONCLUSIVE"
+    assert out["overall"] == "INCONCLUSIVE"
+
+
+def test_put_burst_keys_unique_by_default():
+    """V4-9: bursts write unique keys (no silent overwrites)."""
+    FakeS3.put_calls.clear()
+    loadgen.put_burst("noisy", "b", "demo-x/raw", seconds=0.3, threads=2)
+    keys = [k for u, k in FakeS3.put_calls]
+    assert len(keys) > 10 and len(keys) == len(set(keys))
