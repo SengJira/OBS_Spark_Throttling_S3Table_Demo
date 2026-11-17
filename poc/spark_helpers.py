@@ -85,15 +85,16 @@ def public_conf():
     }
 
 
-def secret_conf(tables_user="tables-rw", s3a_user="admin"):
-    """Credential-bearing settings for one (tables identity, S3A identity)."""
+def secret_conf(tables_user="tables-rw", s3a_user="admin", bucket_users=None):
+    """Credential-bearing settings for one (tables identity, S3A identity)
+    plus optional per-bucket S3A credentials ({bucket: user})."""
     t_ak, t_sk = config.USERS[tables_user]
     s_ak, s_sk = config.USERS[s3a_user]
     if not (t_ak and t_sk and s_ak and s_sk):
         raise RuntimeError(
             f"missing credentials for {tables_user!r} / {s3a_user!r} — "
             f"run scripts/prep_obs.py (keys live in {config.CREDS_FILE})")
-    return {
+    conf = {
         "spark.hadoop.fs.s3a.access.key": s_ak,
         "spark.hadoop.fs.s3a.secret.key": s_sk,
         f"{CATALOG}.rest.access-key-id": t_ak,
@@ -101,6 +102,14 @@ def secret_conf(tables_user="tables-rw", s3a_user="admin"):
         f"{CATALOG}.s3.access-key-id": t_ak,
         f"{CATALOG}.s3.secret-access-key": t_sk,
     }
+    for bucket, user in (bucket_users or {}).items():
+        ak, sk = config.USERS[user]
+        if not (ak and sk):
+            raise RuntimeError(
+                f"missing credentials for bucket {bucket!r} user {user!r}")
+        conf[f"spark.hadoop.fs.s3a.bucket.{bucket}.access.key"] = ak
+        conf[f"spark.hadoop.fs.s3a.bucket.{bucket}.secret.key"] = sk
+    return conf
 
 
 def write_private(path, text):
@@ -116,20 +125,25 @@ def write_private(path, text):
     return path
 
 
-def _secret_conf_file(tables_user, s3a_user):
+def _secret_conf_file(tables_user, s3a_user, bucket_users=None):
     """0600 Spark properties file with the session's credentials; passed as
     --properties-file so keys never appear on the spark-submit command line."""
-    conf = secret_conf(tables_user, s3a_user)
-    path = config.SECRETS_DIR / f"spark-{tables_user}-{s3a_user}.conf"
+    conf = secret_conf(tables_user, s3a_user, bucket_users)
+    tag = "-buckets" if bucket_users else ""
+    path = config.SECRETS_DIR / f"spark-{tables_user}-{s3a_user}{tag}.conf"
     return write_private(
         path, "".join(f"{k} {v}\n" for k, v in sorted(conf.items())))
 
 
-def build_session(app="obs-poc", tables_user="tables-rw", s3a_user="admin"):
+def build_session(app="obs-poc", tables_user="tables-rw", s3a_user="admin",
+                  bucket_users=None):
     """SparkSession on the standalone cluster.
 
     tables_user: identity for the Iceberg `os` catalog (REST + S3FileIO).
     s3a_user:    identity for s3a:// paths (ordinary buckets).
+    bucket_users: optional {bucket: user} per-bucket S3A credentials
+    (fs.s3a.bucket.<bucket>.access.key/secret.key), e.g.
+    {"poc-throttle": "noisy"}.
     Safe to call again in the same kernel after spark.stop() to switch
     identity — verify with identities(spark)."""
     from pyspark import SparkContext
@@ -154,7 +168,7 @@ def build_session(app="obs-poc", tables_user="tables-rw", s3a_user="admin"):
     conf = public_conf()
     if gw is None:
         # fresh JVM: secrets via a 0600 properties file, not --conf arguments
-        conf_file = _secret_conf_file(tables_user, s3a_user)
+        conf_file = _secret_conf_file(tables_user, s3a_user, bucket_users)
         os.environ["PYSPARK_SUBMIT_ARGS"] = \
             f"--properties-file {conf_file} pyspark-shell"
     else:
@@ -173,7 +187,7 @@ def build_session(app="obs-poc", tables_user="tables-rw", s3a_user="admin"):
             gw.jvm.org.apache.hadoop.fs.FileSystem.closeAll()
         except Exception:
             pass
-        conf.update(secret_conf(tables_user, s3a_user))
+        conf.update(secret_conf(tables_user, s3a_user, bucket_users))
 
     b = SparkSession.builder.master(config.SPARK_MASTER).appName(app)
     for k, v in conf.items():
@@ -205,6 +219,53 @@ def identities(spark):
         tables = f"MIXED({tables}/{_user_of(io_ak)})"
     return {"tables": tables, "s3a": _user_of(s3a_ak),
             "tables_key": config.mask(rest_ak), "s3a_key": config.mask(s3a_ak)}
+
+
+def bucket_identities(spark, buckets):
+    """Per-bucket S3A identity of the RUNNING session: for each bucket the
+    user whose key fs.s3a.bucket.<bucket>.access.key (or the default
+    fs.s3a.access.key when no per-bucket key is set) resolves to."""
+    hconf = spark.sparkContext._jsc.hadoopConfiguration()
+    default_ak = hconf.get("fs.s3a.access.key")
+    return {b: _user_of(hconf.get(f"fs.s3a.bucket.{b}.access.key")
+                        or default_ak)
+            for b in buckets}
+
+
+def benchmark_writes(spark, prefix, pairs, rows, partitions, repeats=1,
+                     warmup_bucket=None):
+    """Time `spark.range(rows).repartition(partitions).write.json()` once per
+    (label, bucket) pair per repeat round — admin/noisy/admin/noisy for
+    repeats=2. `pairs` is a list of (label, bucket). With warmup_bucket set,
+    one tiny untimed write as that bucket's identity runs first to load the
+    JVM classes and initialise S3A.
+
+    Returns (times, targets, timed_start, errors): times[label] =
+    [seconds per successful run], targets = [(label, "<prefix>/
+    spark-write-<label>-<i>")] in run order, timed_start = epoch when the
+    timed writes began (after the warm-up), errors = [{"label", "target",
+    "error"}] for writes that raised (the loop continues)."""
+    import time
+    times = {label: [] for label, _ in pairs}
+    targets, errors = [], []
+    if warmup_bucket:
+        spark.range(1000).coalesce(1).write.mode("overwrite").json(
+            f"s3a://{warmup_bucket}/{prefix}/spark-write-warmup")
+    timed_start = time.time()
+    for i in range(max(1, int(repeats))):
+        for label, bucket in pairs:
+            target = f"{prefix}/spark-write-{label}-{i}"
+            t0 = time.time()
+            try:
+                spark.range(rows).repartition(partitions).write.mode(
+                    "overwrite").json(f"s3a://{bucket}/{target}")
+            except Exception as e:
+                errors.append({"label": label, "target": target,
+                               "error": str(e).splitlines()[0][:300]})
+                continue
+            times[label].append(round(time.time() - t0, 1))
+            targets.append((label, target))
+    return times, targets, timed_start, errors
 
 
 def iceberg_version(spark):
